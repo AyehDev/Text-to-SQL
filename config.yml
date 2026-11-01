@@ -1,8 +1,0 @@
-text-to-sql:
-  postgres:
-    host: localhost
-    port: 5432
-    sslmode: prefer
-    statement_timeout_ms: 10000
-    admin:    { user: sg_admin,    password_env: PG_ADMIN_PASSWORD }
-    readonly: { user: sg_readonly, password_env: PG_READONLY_PASSWORD }
