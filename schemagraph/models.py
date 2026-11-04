@@ -21,7 +21,7 @@ RelationshipSource = Literal["declared", "inferred"]
 Cardinality = Literal["N:1", "1:1"]
 Traversal = Literal["many_to_one", "one_to_many"]
 PlanStatus = Literal["full", "partial", "single_table", "none"]
-PlanAlgorithm = Literal["gds_steiner", "networkx_steiner", "shortest_path", "none"]
+PlanAlgorithm = Literal["gds_steiner", "exact_steiner", "networkx_steiner", "shortest_path", "none"]
 AskStatus = Literal[
     "success", "invalid_sql", "execution_error", "no_schema", "unsafe_sql"
 ]

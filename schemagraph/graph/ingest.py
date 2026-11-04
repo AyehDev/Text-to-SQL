@@ -20,13 +20,12 @@ from __future__ import annotations
 import argparse
 import json
 import logging
-from collections.abc import Iterable, Iterator
-from contextlib import contextmanager
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
 from schemagraph.extraction import extract
+from schemagraph.graph.cypher import batches, read, use_session, write
 from schemagraph.graph.weights import edge_weights
 from schemagraph.models import DatabaseMetadata, IngestReport, schema_uid
 
@@ -197,38 +196,8 @@ def compare(rows: GraphRows, actual: dict[str, Any]) -> list[str]:
 # ---------------------------------------------------------------------------
 
 
-@contextmanager
-def _use(session: Any | None) -> Iterator[Any]:
-    """The caller's session, or a fresh one that is closed afterwards."""
-    if session is not None:
-        yield session
-        return
-    from schemagraph.graph import driver  # imported here so tests need no neo4j server
-
-    with driver.session() as s:
-        yield s
-
-
-def _batches(rows: list, size: int) -> Iterable[list]:
-    for i in range(0, len(rows), size):
-        yield rows[i : i + size]
-
-
-def _write(session: Any, query: str, rows: list, batch_size: int) -> None:
-    """Run one statement over the rows, one transaction per batch."""
-
-    def work(tx: Any, batch: list) -> None:
-        tx.run(query, rows=batch).consume()
-
-    for batch in _batches(rows, batch_size):
-        session.execute_write(work, batch)
-
-
-def _read(session: Any, query: str, **params: Any) -> list[dict[str, Any]]:
-    def work(tx: Any) -> list[dict[str, Any]]:
-        return [record.data() for record in tx.run(query, **params)]
-
-    return session.execute_read(work)
+# Shared helpers live in graph/cypher.py; the old private names stay as aliases.
+_use, _batches, _write, _read = use_session, batches, write, read
 
 
 def create_constraints_and_indexes(session: Any | None = None) -> None:
