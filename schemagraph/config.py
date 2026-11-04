@@ -72,6 +72,9 @@ class PostgresConfig(BaseModel):
             "user": creds.user,
             "password": creds.password.get_secret_value(),
             "sslmode": self.sslmode,
+            # Without this, a SQL_ASCII database (common for restored sample
+            # data) makes psycopg return bytes instead of str for every text.
+            "client_encoding": "utf8",
         }
         if role == "readonly":
             # Enforced per connection, so no caller can forget to set them:
@@ -84,11 +87,33 @@ class PostgresConfig(BaseModel):
         return make_conninfo(**params)
 
 
+class Neo4jConfig(BaseModel):
+    """Connection to the Neo4j graph store. The password comes from an env var."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    uri: str = "bolt://localhost:7687"
+    user: str = "neo4j"
+    password_env: str = "NEO4J_PASSWORD"
+    # Community edition has a single database, named "neo4j". Every db_id lives in
+    # it, kept apart by the db_id property on each node.
+    database: str = "neo4j"
+
+    @cached_property
+    def password(self) -> SecretStr:
+        value = os.environ.get(self.password_env)
+        if value is None:
+            raise RuntimeError(f"Environment variable {self.password_env} is not set")
+        return SecretStr(value)
+
+
 class AppConfig(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     postgres: PostgresConfig
-    # neo4j: Neo4jConfig         <- with graph/ingest.py
+    # Optional so that extraction-only setups need no Neo4j section. Code that
+    # needs the graph calls graph.driver.get_driver(), which says what is missing.
+    neo4j: Neo4jConfig | None = None
     # llm: LLMConfig             <- with pipeline/
     # pipeline: PipelineConfig   <- top_k, max_attempts, row_limit
     # graph: GraphConfig         <- max_bridge_tables, weight penalties

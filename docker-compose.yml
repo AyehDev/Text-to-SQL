@@ -2,7 +2,7 @@ services:
   db:
     image: postgres:17
     ports:
-      - "127.0.0.1:5432:5432"   # <- added; binds to your machine only, not the network
+      - "127.0.0.1:5432:5432"
     environment:
       POSTGRES_USER: app
       POSTGRES_PASSWORD: ${DB_PASSWORD}
@@ -12,5 +12,16 @@ services:
       - pgdata:/var/lib/postgresql/data
       - ./initdb:/docker-entrypoint-initdb.d:ro
 
+  neo4j:
+    image: neo4j:5-community
+    ports:
+      - "127.0.0.1:7474:7474"   # browser UI
+      - "127.0.0.1:7687:7687"   # bolt, what the driver uses
+    environment:
+      NEO4J_AUTH: neo4j/${NEO4J_PASSWORD}
+    volumes:
+      - neo4jdata:/data
+
 volumes:
   pgdata:
+  neo4jdata:

@@ -1,8 +1,20 @@
-text-to-sql:
-  postgres:
-    host: localhost
-    port: 5432
-    sslmode: prefer
-    statement_timeout_ms: 10000
-    admin:    { user: sg_admin,    password_env: PG_ADMIN_PASSWORD }
-    readonly: { user: sg_readonly, password_env: PG_READONLY_PASSWORD }
+# Copy to config.yml (not committed). Passwords are never written here:
+# each role names the environment variable that holds its password.
+postgres:
+  host: 127.0.0.1
+  port: 5432
+  sslmode: prefer
+  statement_timeout_ms: 10000
+  admin:                      # extraction, inference, data loading
+    user: sg_admin
+    password_env: PG_ADMIN_PASSWORD
+  readonly:                   # SELECT only; runs every LLM-generated query
+    user: sg_readonly
+    password_env: PG_READONLY_PASSWORD
+
+# Needed by the graph stages (ingest, planner, retrieval); extraction does not use it.
+neo4j:
+  uri: bolt://localhost:7687
+  user: neo4j
+  password_env: NEO4J_PASSWORD
+  database: neo4j

@@ -10,6 +10,7 @@ dependencies = [
     "pydantic>=2.5",
     "pyyaml>=6",
     "psycopg[binary]>=3.1",
+    "neo4j>=5.20",
 ]
 
 [project.optional-dependencies]
