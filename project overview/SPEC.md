@@ -2,6 +2,8 @@
 
 This document defines how the codebase is organized, what each module exposes, the API endpoints, and the JSON formats passed between components. Its purpose is to let all four members build in parallel against agreed interfaces.
 
+**Status:** this version reflects the implemented code. Where the first draft and the code differed, the spec now follows the code; each such change is marked **(changed)** and collected in Section 8, which also has the build status of every module. Items marked **(open)** await a team decision.
+
 **Rule:** the data contracts in Section 3 (implemented in `schemagraph/models.py`) are shared. Any change to them goes through a pull request that the whole group reviews, because every component depends on them.
 
 ---
@@ -10,9 +12,11 @@ This document defines how the codebase is organized, what each module exposes, t
 
 ```
 schemagraph/
-├── docker-compose.yml          # PostgreSQL, Neo4j (+ GDS plugin), API
-├── .env.example                # connection strings, API keys, model names
-├── requirements.txt
+├── docker-compose.yml          # PostgreSQL, Neo4j Community (no GDS plugin), API
+├── config.example.yml          # copy to config.yml: Postgres roles, Neo4j, embedding   (changed from .env.example)
+├── pyproject.toml              # dependencies and pytest config                           (changed from requirements.txt)
+├── pytest.ini                  # markers: integration, adventureworks, neo4j
+├── README.md                   # setup, data sources, API reference, who owns what
 ├── SPEC.md                     # this file
 │
 ├── contracts/
@@ -22,7 +26,7 @@ schemagraph/
 │       └── ask_response.sample.json
 │
 ├── schemagraph/                # Python package (backend)
-│   ├── config.py               # settings loaded from .env          [shared]
+│   ├── config.py               # settings loaded from config.yml    [shared]
 │   ├── models.py               # Pydantic data contracts            [shared]
 │   │
 │   ├── db/                     # PostgreSQL access                   [Emmanuel]
@@ -36,11 +40,15 @@ schemagraph/
 │   │   │   ├── foreign_keys.sql
 │   │   │   └── unique_constraints.sql
 │   │   ├── extract.py
-│   │   └── infer.py
+│   │   ├── infer.py
+│   │   └── build_metadata.py   # CLI: extract → infer → save, for one or all databases
 │   │
 │   ├── graph/                  # Neo4j model, enrichment, planning   [Cameron]
+│   │   ├── driver.py           # one shared Neo4j driver and session()
+│   │   ├── cypher.py           # session helpers shared by ingest/queries/retrieve
 │   │   ├── ingest.py
 │   │   ├── weights.py
+│   │   ├── vector.py           # Embedder interface, text to embed, vector indexes
 │   │   ├── enrich.py
 │   │   ├── queries.py
 │   │   ├── retrieve.py
@@ -62,11 +70,15 @@ schemagraph/
 │       │   ├── adventureworks.jsonl
 │       │   ├── bird_subset.jsonl
 │       │   └── fewshot_examples.jsonl
+│       ├── infer_recovery.py   # hides declared FKs, measures how many inference recovers
 │       ├── compare.py
 │       ├── schema_metrics.py
 │       └── run_eval.py
 │
 ├── scripts/
+│   ├── create_roles.sql        # sg_readonly role and grants (Section 7)
+│   ├── load_adventureworks.sh  # downloads/loads AdventureWorks into Postgres
+│   ├── load_bird.sh            # loads the BIRD mini-dev PostgreSQL databases
 │   ├── build_graph.py          # CLI: extract → infer → ingest → enrich
 │   └── export_contracts.py     # writes JSON Schema from models.py
 │
@@ -81,6 +93,8 @@ schemagraph/
         └── mocks/              # copies of contracts/examples/*.json
 ```
 
+Data files (`data/metadata/{db_id}.json`, `data/bird/`) are generated and not committed.
+
 **Ports:** PostgreSQL 5432 · Neo4j 7474 (browser) / 7687 (bolt) · API 8000 · frontend 5173.
 
 ---
@@ -93,18 +107,22 @@ Several databases (AdventureWorks plus a few BIRD databases) share one Neo4j ins
 
 | Thing | Format | Example |
 |---|---|---|
-| Database ID (`db_id`) | lowercase, no spaces | `adventureworks` |
+| Database ID (`db_id`) | lowercase letters, digits and `_` (`^[a-z0-9_]+$`); equals the PostgreSQL database name | `adventureworks` |
+| Schema UID | `{db_id}:{schema}` | `adventureworks:sales` **(open: confirm with Cameron)** |
 | Table UID | `{db_id}:{schema}.{table}` | `adventureworks:sales.customer` |
 | Column UID | `{db_id}:{schema}.{table}.{column}` | `adventureworks:sales.customer.customerid` |
 | Display name (shown to users) | `{schema}.{table}[.{column}]` | `sales.customer.customerid` |
 
 - Use names exactly as stored in the PostgreSQL catalog (PostgreSQL folds unquoted names to lowercase).
+- Build UIDs only with the helpers in `models.py`, and never parse one: use `ColumnMeta.table_uid` to get a column's table.
+- Dump models with `by_alias=True` so the aliases (`schema` on tables, `from` on `ExplainJoin`) are written.
 - Uniqueness constraints in Neo4j are on `uid`, never on bare names (bare names repeat across tables and schemas).
 
 ### 2.2 Relationship direction and cardinality
 
 - A `REFERENCES` relationship always points **from the foreign-key column to the referenced column** (the "many" side to the "one" side).
 - `cardinality` is `"N:1"`, or `"1:1"` when the foreign-key column is itself unique.
+- A `1:1` edge is safe to walk both ways, so it costs the same in both directions **(changed; open)**.
 - Traversing a relationship in its stored direction is **many-to-one** (safe). Traversing against it is **one-to-many** (fan-out: can duplicate rows).
 
 ### 2.3 Modes
@@ -119,7 +137,7 @@ Every pipeline call takes a `mode`, which selects how schema context is built. A
 
 ### 2.4 General
 
-- Python 3.11+, type hints everywhere, Pydantic v2 for all data passed between modules.
+- Python 3.11+ (developed on 3.13), type hints everywhere, Pydantic v2 for all data passed between modules.
 - Functions return Pydantic models, not raw dicts.
 - LLM temperature is always 0. Model names come from `config.py`, never hardcoded.
 - Every module has a pytest file. Pure functions (weights, result comparison, SQL table extraction) must have unit tests.
@@ -194,7 +212,9 @@ Produced by `extraction/extract.py` + `extraction/infer.py`. Consumed by `graph/
 | Field | Values / notes |
 |---|---|
 | `description_source` | `"catalog"` (from `obj_description`/`col_description`), `"generated"` (set later by enrichment), or `null` if none |
-| `sample_values` | Up to 5 distinct non-null values as strings; used only for generating descriptions and inference |
+| `sample_values` | Up to 5 distinct non-null values as strings; used for inference, for generating descriptions, and (first 3, trimmed to 40 characters) in the column's embedding text |
+| `primary_key` | Column **names** in key order, not UIDs |
+| `confidence` (inferred) | `0.4 * name_score + 0.6 * value_overlap`, capped at 0.95, so an inferred edge always costs more than a declared one |
 | `source` | `"declared"` (from constraint views) or `"inferred"` |
 | `confidence` | `1.0` for declared; 0–1 for inferred |
 | `evidence` | `null` for declared; inference signals for inferred |
@@ -218,7 +238,7 @@ Produced by `graph/planner.py` (graph mode only). Consumed by `pipeline/context.
 {
   "db_id": "adventureworks",
   "status": "full",
-  "algorithm": "gds_steiner",
+  "algorithm": "shortest_path",
   "seed_tables": [
     { "uid": "adventureworks:sales.salesorderheader", "score": 0.84, "matched_on": "column:totaldue" },
     { "uid": "adventureworks:person.person", "score": 0.79, "matched_on": "column:firstname" }
@@ -269,7 +289,8 @@ Produced by `graph/planner.py` (graph mode only). Consumed by `pipeline/context.
 | Field | Values / notes |
 |---|---|
 | `status` | `"full"` (all seeds connected), `"partial"` (some seeds unreachable), `"single_table"` (one seed, no joins), `"none"` (no plan; pipeline falls back to retrieval context) |
-| `algorithm` | `"gds_steiner"`, `"networkx_steiner"`, `"shortest_path"`, or `"none"` |
+| `algorithm` | `"exact_steiner"` (directed Dreyfus–Wagner, up to 7 seeds), `"shortest_path"` (two seeds), `"networkx_steiner"` (fallback for more seeds, or on request), `"none"`. `"gds_steiner"` stays in the contract but is reserved and never produced **(changed)** |
+| `unreachable_seeds` | Seeds with no path to the others. Listed here, and excluded from `tables` **(open)** |
 | `joins[].from_column` / `to_column` | Always in stored relationship direction (FK → referenced column), regardless of traversal |
 | `traversal` | `"many_to_one"` or `"one_to_many"` (fan-out) |
 | `dropped_seeds` | Seeds removed because the tree exceeded the cost/bridge threshold |
@@ -409,24 +430,41 @@ Graph building is **not** an endpoint. It runs from the command line with `scrip
 
 Signatures are the contract; internal helper functions are up to each owner.
 
-### 5.1 `config.py` — shared
+### 5.1 `config.py` — shared  **(changed: YAML instead of `.env`)**
+
+Settings come from `config.yml` (path overridable with `SCHEMAGRAPH_CONFIG`), validated by Pydantic. Secrets are never in the file: each section names an environment variable that holds the password or key.
+
+```yaml
+postgres:
+  host: localhost
+  port: 5432
+  admin:    { user: sg_admin,    password_env: PG_ADMIN_PASSWORD }      # extraction, inference, loading
+  readonly: { user: sg_readonly, password_env: PG_READONLY_PASSWORD }   # all LLM SQL
+  statement_timeout_ms: 10000
+neo4j:                           # optional; needed by graph/
+  uri: bolt://localhost:7687
+  user: neo4j
+  password_env: NEO4J_PASSWORD
+  database: neo4j                # Community has one database; every db_id lives in it
+embedding:                       # optional; needed by enrich/retrieve
+  base_url: https://api.openai.com/v1
+  model: <embedding model name>  # team's choice
+  dimensions: <vector size>      # must match the vector index; changing it means re-embedding
+  api_key_env: OPENAI_API_KEY    # null for a local server with no key
+  send_dimensions: false
+  batch_size: 64
+  timeout_s: 30
+# llm:      <- with pipeline/ (model name, temperature fixed at 0)
+# pipeline: <- top_k (5), max_attempts (3), row_limit (200)
+```
 
 ```python
-class Settings(BaseSettings):
-    postgres_admin_dsn: str          # used only for loading data and extraction
-    postgres_readonly_dsn: str       # template with {db_id}; used for all generated SQL
-    neo4j_uri: str; neo4j_user: str; neo4j_password: str
-    llm_model: str; embedding_model: str; embedding_dimensions: int
-    top_k: int = 5
-    max_attempts: int = 3
-    row_limit: int = 200
-    statement_timeout_ms: int = 10000
-    max_bridge_tables: int = 4          # plans above this are treated as implausible
-    weight_inferred_penalty: float = 5.0
-    weight_fanout_penalty: float = 1.0
-
-def get_settings() -> Settings
+def get_config() -> AppConfig          # cached; load_config(path) loads a given file
+class PostgresConfig: conninfo(role, db_id)   # role is "admin" or "readonly"; client_encoding=utf8
+class Neo4jConfig; class EmbeddingConfig   # .password / .api_key read the env var, raising if unset
 ```
+
+The planner's tuning values are module constants rather than settings **(changed)**: `CONFIDENCE_PENALTY = 5.0` and `FAN_OUT_PENALTY = 1.0` in `graph/weights.py`, `MAX_BRIDGE_TABLES = 4` and `MAX_EXACT_SEEDS = 7` in `graph/planner.py`. Move them into config if experiments need to vary them.
 
 ### 5.2 `db/postgres.py` — Emmanuel
 
@@ -439,10 +477,12 @@ def run_admin_query(db_id: str, sql: str, params: dict | None = None) -> list[di
     # extraction and inference only, never for LLM-generated SQL
 ```
 
+Read-only connections use the `sg_readonly` role with `statement_timeout` and read-only transactions.
+
 ### 5.3 `extraction/extract.py` — Emmanuel
 
 ```python
-def extract_metadata(db_id: str) -> DatabaseMetadata
+def extract_metadata(db_id: str, *, sample_n: int = 5) -> DatabaseMetadata
 def fetch_tables(db_id: str) -> list[TableMeta]
 def fetch_columns(db_id: str) -> list[ColumnMeta]
 def fetch_primary_keys(db_id: str) -> dict[str, list[str]]      # table_uid -> column names
@@ -453,7 +493,9 @@ def save_metadata(meta: DatabaseMetadata, path: Path) -> None
 def load_metadata(path: Path) -> DatabaseMetadata
 ```
 
-SQL lives in `extraction/sql/*.sql` so it can be read and graded on its own.
+SQL lives in `extraction/sql/*.sql` so it can be read and graded on its own. CLI: `python -m schemagraph.extraction.extract --db X [--out PATH]`.
+
+`extraction/build_metadata.py` runs extract → infer → save for one database (`--db`, repeatable) or all (`--all`), with `--out`, `--skip-inference`, `--sample-n`, `--min-overlap` and `--min-confidence`. It exits non-zero if any database failed.
 
 ### 5.4 `extraction/infer.py` — Emmanuel
 
@@ -462,10 +504,14 @@ def find_candidate_pairs(meta: DatabaseMetadata) -> list[CandidatePair]
     # name matching + compatible types, skipping pairs already declared
 def value_overlap(db_id: str, from_column: str, to_column: str) -> float
     # share of distinct from_column values that exist in to_column
-def infer_relationships(db_id: str, meta: DatabaseMetadata,
-                        min_confidence: float = 0.5) -> list[RelationshipMeta]
+def infer_relationships(db_id: str, meta: DatabaseMetadata, min_confidence: float = 0.5,
+                        min_overlap: float = 0.9) -> list[RelationshipMeta]
     # source="inferred", with confidence and evidence
+def with_inferred(db_id: str, meta: DatabaseMetadata, **kwargs) -> DatabaseMetadata
+    # replaces any old inferred edges; idempotent
 ```
+
+Rules, in order: (1) the target column is unique; (2) the name signal is `exact`, `suffix` or `table_name` (generic names such as `id` and `rowguid` never match); (3) types are in the same family; (4) value overlap is at least `min_overlap`; (5) each source column gets one parent, the tightest match; (6) a unique source (1:1) needs an `exact` name and must point from the smaller table to the larger, and an edge is never inferred in both directions; (7) declared relationships are never replaced. `confidence = 0.4 * name_score + 0.6 * overlap`, capped at 0.95. Tuned on AdventureWorks; a held-out run on BIRD has not been done.
 
 ### 5.5 `graph/ingest.py` — Cameron
 
@@ -473,31 +519,55 @@ def infer_relationships(db_id: str, meta: DatabaseMetadata,
 def create_constraints_and_indexes() -> None
     # UNIQUE on :Table(uid), :Column(uid); indexes on :Table(name), :Column(name), db_id
 def clear_database(db_id: str) -> None
-def ingest_metadata(meta: DatabaseMetadata) -> IngestReport
-    # Schema/Table/Column nodes, CONTAINS, HAS_COLUMN, REFERENCES; idempotent (MERGE)
+    # deletes only this db_id, in batches
+def ingest_metadata(meta: DatabaseMetadata, session=None, rebuild: bool = False,
+                    batch_size: int = 500) -> IngestReport
+    # Schema/Table/Column nodes, CONTAINS, HAS_COLUMN, REFERENCES; idempotent (UNWIND/MERGE)
 def apply_weights(db_id: str) -> None
     # sets weight_forward and weight_reverse on every REFERENCES edge
 def verify_against_metadata(meta: DatabaseMetadata) -> list[str]
     # returns discrepancies (missing tables, etc.); empty list = OK
 ```
 
+Every node carries `db_id`. `REFERENCES` edges carry `source`, `confidence`, `cardinality`, `constraint_name`, `evidence_json` (JSON text), `weight_forward`, `weight_reverse`, `from_table`, `to_table`, `db_id`. CLI: `python -m schemagraph.graph.ingest --db X [--meta PATH] [--rebuild]`. Functions take an optional `session` (a Neo4j session, or a fake in tests) and otherwise open one from `graph/driver.py`.
+
 ### 5.6 `graph/weights.py` — Cameron (pure functions, unit tested)
 
 ```python
-def edge_weight(source: str, confidence: float, traversal: str, settings: Settings) -> float
-    # 1 + inferred penalty * (1 - confidence) + fan-out penalty if traversal == "one_to_many"
+def edge_weight(confidence: float, direction: Literal["forward", "reverse"]) -> float
+    # 1 + 5 * (1 - confidence) + 1 if direction == "reverse"; rounded to 6 places
+def edge_weights(confidence: float, cardinality: str) -> tuple[float, float]
+    # (forward, reverse); for 1:1 the reverse equals the forward
 ```
+
+**(changed)** `source` is no longer a parameter because `confidence` already encodes it (declared = 1.0), and the penalties are module constants, so `settings` is gone. `"forward"` is `many_to_one` and `"reverse"` is `one_to_many`. A declared edge costs 1.0 forward and 2.0 reverse. **(open: Cameron to confirm the signature.)**
 
 ### 5.7 `graph/enrich.py` — Cameron
 
 ```python
 def generate_missing_descriptions(db_id: str) -> int
     # LLM writes descriptions from names + sample values; sets description_source="generated"
-def embed_nodes(db_id: str, include_generated: bool = True) -> int
-def create_vector_indexes() -> None
+    # NOT YET WRITTEN
+def embed_nodes(db_id: str, embedder: Embedder | None = None, session=None,
+                include_generated: bool = True, batch_size: int = 500) -> EmbedReport
+    # EmbedReport(tables, columns); stores vectors in the `embedding` property
 ```
 
-`include_generated=False` supports the ablation without generated descriptions.
+`graph/vector.py` holds the pieces `embed_nodes` and `retrieve` share **(changed: `create_vector_indexes` moved here and takes the dimension)**:
+
+```python
+class Embedder(Protocol):                 # same two methods as LangChain Embeddings
+    def embed_query(self, text: str) -> list[float]
+    def embed_documents(self, texts: list[str]) -> list[list[float]]
+class OpenAICompatibleEmbedder            # POST {base_url}/embeddings; batches; retries 429/5xx; checks dimensions
+def get_embedder() -> Embedder            # from config.yml `embedding:`
+def table_text(table, include_generated=True) -> str     # schema.name (humanized) + description
+def column_text(table, column, include_generated=True) -> str   # schema.table.column (type): description. Examples: up to 3
+def create_vector_indexes(dimensions: int) -> None       # table_embedding, column_embedding; cosine; IF NOT EXISTS
+def drop_vector_indexes() -> None
+```
+
+`include_generated=False` supports the ablation without generated descriptions: descriptions whose `description_source` is `"generated"` are left out of the embedded text. Vector indexes need Neo4j 5.13 or later. An existing index keeps its dimension, so changing the embedding model means dropping the indexes and re-embedding every database.
 
 ### 5.8 `graph/queries.py` — Cameron
 
@@ -506,23 +576,34 @@ def get_tables(db_id: str, uids: list[str]) -> list[TableDetail]   # table + col
 def get_all_tables(db_id: str) -> list[TableDetail]                # full-schema mode
 def list_tables(db_id: str) -> list[TableSummary]                  # /api/schema
 def get_table_detail(db_id: str, uid: str) -> TableWithRelationships
+def get_reference_edges(db_id: str, include_inferred: bool = True) -> list[ReferenceEdge]
+    # every edge with column and table ends and both weights; the planner's input
 ```
+
+`get_tables` keeps the order of `uids` and skips unknown UIDs with a warning, so a stale retrieval result cannot break prompt building. `get_table_detail` raises `TableNotFound`; the API should map it to a client error (the spec's 400 for unknown input).
 
 ### 5.9 `graph/retrieve.py` — Cameron
 
 ```python
-def retrieve_seed_tables(db_id: str, question: str, k: int) -> list[SeedTable]
+def retrieve_seed_tables(db_id: str, question: str, k: int, *, embedder=None, session=None,
+                         candidates: int = 100, min_score: float | None = None) -> list[SeedTable]
     # vector search over tables and columns; column hits roll up to their table (max score)
+def rollup(table_hits, column_hits, k) -> list[SeedTable]      # pure
 ```
+
+The question is embedded once. The two vector indexes hold every `db_id`, so each search over-fetches (`candidates` tables, three times that for columns) and keeps only hits with `node.db_id = $db_id`. A table's score is the best of its own and its columns'; `matched_on` is `"table"` when the table's own score is at least the best column score, otherwise `"column:<name>"`. Results are sorted by score then UID, scores rounded to 4 places. Fewer than `k` come back if the database has fewer; an empty question returns `[]`.
 
 ### 5.10 `graph/planner.py` — Cameron
 
 ```python
-def plan_joins(db_id: str, seeds: list[SeedTable],
-               include_inferred: bool = True, weighted: bool = True) -> JoinPlan
+def plan_joins(db_id: str, seeds: list[SeedTable], include_inferred: bool = True, weighted: bool = True,
+               *, max_bridge_tables: int = 4, algorithm: str | None = None, session=None) -> JoinPlan
+def plan_from_edges(db_id, seeds, edges, *, include_inferred=True, weighted=True,
+                    max_bridge_tables=4, algorithm=None, max_alternatives=2) -> JoinPlan
+    # the same search on in-memory edges; plan_joins reads edges with queries.get_reference_edges
 ```
 
-Internally: group seeds by connected component → Steiner tree (GDS, NetworkX fallback) → check `max_bridge_tables` → map table links back to column pairs → find runner-up path for `alternatives`. `include_inferred=False` and `weighted=False` support the ablations. **Never raises for "no path"**; returns `status="partial"` or `"none"` instead.
+**(changed: no GDS.)** Internally: collapse column edges to table-level arcs (forward for many-to-one; reverse, one-to-many, only for N:1 edges; a composite foreign key is one link) → exact directed Steiner tree by Dreyfus–Wagner over all seed subsets for up to 7 seeds (two seeds is a shortest path; one DP answers every root), or NetworkX's Mehlhorn approximation on undirected minimum-direction costs for more seeds or `algorithm="networkx"` → check `max_bridge_tables`, dropping the lowest-score seed (listed in `dropped_seeds`) until the plan fits → map table links back to column pairs → find up to 2 runner-up paths by banning each bridge in turn, keeping only those with distinct table sets, for `alternatives`. `include_inferred=False` and `weighted=False` support the ablations. **Never raises for "no path"**; returns `status="partial"` or `"none"` instead.
 
 ### 5.11 `pipeline/context.py` — Mohammed
 
@@ -616,7 +697,9 @@ Gold SQL is executed with `run_readonly_query` and cached, so each gold query ru
 python scripts/build_graph.py --db adventureworks [--skip-inference] [--skip-enrichment]
 ```
 
-Runs `extract_metadata` → `infer_relationships` → `save_metadata` → `ingest_metadata` → `apply_weights` → `generate_missing_descriptions` → `embed_nodes` → `verify_against_metadata`.
+Runs `extract_metadata` → `infer_relationships` → `save_metadata` → `ingest_metadata` → `apply_weights` → `generate_missing_descriptions` → `create_vector_indexes` → `embed_nodes` → `verify_against_metadata`.
+
+**Not yet written.** `extraction/build_metadata.py` covers the first three steps, and `python -m schemagraph.graph.ingest` covers ingest and weights.
 
 ### 5.22 Frontend — Davin
 
@@ -669,3 +752,47 @@ Build against `src/mocks/ask_response.json` until the backend is ready, with a `
 - `statement_timeout` is set on every read-only connection.
 - `is_single_select` must pass before `explain` is even called.
 - The admin connection is used only by extraction, inference, and data loading.
+- Two PostgreSQL roles: `sg_admin` (extraction, inference, loading) and `sg_readonly` (`SELECT` only; created by `scripts/create_roles.sql`, which must be re-run after loading a database so the grants cover its tables). Passwords come from environment variables named in `config.yml`.
+- Nothing else executes model-written SQL: it passes `is_single_select`, then `run_readonly_query`.
+
+---
+
+## 8. Implementation status and decisions
+
+### 8.1 Build status
+
+| Module | Owner | Status |
+|---|---|---|
+| `config.py`, `models.py` | shared | Built, tested |
+| `db/postgres.py` | Emmanuel | Built, tested |
+| `extraction/extract.py`, `infer.py`, `build_metadata.py` | Emmanuel | Built, tested (inference tuned on AdventureWorks only) |
+| `eval/infer_recovery.py` | Emmanuel | Built |
+| `eval/compare.py`, `schema_metrics.py`, `run_eval.py`, `eval/questions/*` | Emmanuel | Not started |
+| `graph/weights.py`, `driver.py`, `cypher.py`, `ingest.py`, `queries.py`, `planner.py` | Cameron | Written and tested with fakes; Cypher not yet run on a real Neo4j |
+| `graph/vector.py`, `retrieve.py`, `enrich.embed_nodes` | Cameron | Written and tested with fakes and a local HTTP server; Cypher not yet run on a real Neo4j |
+| `graph/enrich.generate_missing_descriptions` | Cameron | Not started |
+| `scripts/build_graph.py`, `export_contracts.py` | Cameron / Emmanuel | Not started |
+| `pipeline/*`, `api/main.py` | Mohammed | Not started |
+| `frontend/` | Davin | Not started |
+| `contracts/examples/`: metadata and join plan samples | | Done. `ask_response.sample.json` still to write |
+
+### 8.2 Changes from the first draft
+
+1. **Config is `config.yml`, not `.env`** (5.1). Two Postgres roles, optional `neo4j` and `embedding` sections.
+2. **No GDS.** The planner is an exact Steiner solver with a NetworkX fallback (5.10). `exact_steiner` is a new `algorithm` value; `gds_steiner` is reserved.
+3. **`edge_weight(confidence, direction)`** replaces the four-argument form (5.6).
+4. **Embeddings** go through an `Embedder` interface and any OpenAI-style endpoint; `create_vector_indexes` takes the dimension (5.7).
+5. **`db_id` format** is fixed (`^[a-z0-9_]+$`), Schema uids are `{db_id}:{schema}`, and UIDs are never parsed (2.1).
+6. **1:1 edges** cost the same in both directions; inferred confidence is capped at 0.95 (2.2, 3.1).
+7. Several functions gained optional `session`, `rebuild`, `sample_n` and similar parameters. These are additive and do not break callers written to the first draft.
+
+### 8.3 Open decisions
+
+- Confirm with Cameron: the Schema uid format, the 1:1 reverse weight, the 0.95 inferred cap, the `edge_weight` signature, the `exact_steiner` contract value, and listing unreachable seeds without including them in `tables`.
+- The embedding model and `dimensions` (set in `config.yml`; they fix the vector index).
+- Whether planner constants (`CONFIDENCE_PENALTY`, `FAN_OUT_PENALTY`, `MAX_BRIDGE_TABLES`) move into config.
+- A held-out BIRD run to check that inference and planning are not tuned only to AdventureWorks.
+
+### 8.4 Testing
+
+Unit tests use pure builders and injected fakes (a fake Neo4j session, a fake vector store, a local HTTP server for the embedder) and need no services. Integration tests are gated by environment variables: `SG_TEST_PG_DSN`, `SG_TEST_ADVENTUREWORKS=1`, `SG_TEST_NEO4J=1` (with `NEO4J_PASSWORD`), under the markers `integration`, `adventureworks` and `neo4j`. New logic is mutation-checked: break the code and confirm a test fails.
