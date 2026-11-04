@@ -2,5 +2,5 @@ text-to-sql/
 .env
 mini_dev/
 adventureworks-for-postgres/
-.pytest_cache/
-schemagraph/__pycache__
+pytest_cache/
+__pycache__/
