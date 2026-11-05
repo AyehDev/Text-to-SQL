@@ -2,7 +2,10 @@
 
 - the `Embedder` interface (the same two methods as LangChain's `Embeddings`, so
   a LangChain embeddings object can be passed anywhere an Embedder is wanted)
-- `OpenAICompatibleEmbedder`, a small HTTP client for any OpenAI-style /embeddings endpoint
+- two HTTP embedders: `OpenAICompatibleEmbedder` (OpenAI and look-alike servers) and
+  `VoyageEmbedder` (Voyage AI, which Anthropic recommends because it has no embedding
+  model of its own), chosen by `embedding.provider` in config.yml
+- the names of the Neo4j indexes and property that hold one model's vectors
 - the text that gets embedded for a table and for a column (pure functions)
 - creating and dropping the two Neo4j vector indexes
 
@@ -16,11 +19,12 @@ from __future__ import annotations
 
 import json
 import logging
+import re
 import time
 import urllib.error
 import urllib.request
 from collections.abc import Callable
-from typing import Any, Protocol
+from typing import Any, NamedTuple, Protocol
 
 from schemagraph.config import EmbeddingConfig, get_config
 from schemagraph.graph.cypher import use_session
@@ -28,9 +32,11 @@ from schemagraph.models import ColumnMeta, TableMeta
 
 log = logging.getLogger(__name__)
 
-TABLE_INDEX = "table_embedding"
+DEFAULT_NAME = "default"
+TABLE_INDEX = "table_embedding"      # names for the default set of vectors; see embedding_names()
 COLUMN_INDEX = "column_embedding"
 EMBEDDING_PROP = "embedding"
+_NAME_RE = re.compile(r"^[a-z][a-z0-9_]{0,30}$")
 
 MAX_SAMPLE_VALUES = 3
 MAX_SAMPLE_CHARS = 40
@@ -44,6 +50,36 @@ class Embedder(Protocol):
     def embed_query(self, text: str) -> list[float]: ...
 
     def embed_documents(self, texts: list[str]) -> list[list[float]]: ...
+
+
+class EmbeddingNames(NamedTuple):
+    table_index: str
+    column_index: str
+    prop: str
+
+
+def embedding_names(name: str = DEFAULT_NAME) -> EmbeddingNames:
+    """Index and property names for one set of vectors.
+
+    Vectors from different models cannot be compared, and an index holds one dimension,
+    so each model gets its own set. The default name keeps the plain names
+    (`table_embedding`, `column_embedding`, `embedding`); any other name is added as a
+    suffix (`table_embedding_voyage`). The names go into Cypher text, so they are checked.
+    """
+    if not isinstance(name, str) or not _NAME_RE.match(name):
+        raise ValueError(f"embedding name must be lowercase letters, digits and _, got {name!r}")
+    if name == DEFAULT_NAME:
+        return EmbeddingNames(TABLE_INDEX, COLUMN_INDEX, EMBEDDING_PROP)
+    return EmbeddingNames(f"{TABLE_INDEX}_{name}", f"{COLUMN_INDEX}_{name}", f"{EMBEDDING_PROP}_{name}")
+
+
+def names_for(embedder: object, name: str | None = None) -> EmbeddingNames:
+    """The names to use with `embedder`: an explicit `name`, else the embedder's own, else the default.
+
+    HTTP embedders carry the `name` from config, so vectors are always written and searched
+    under the name of the model that made them. Test doubles without a name use the default.
+    """
+    return embedding_names(name or getattr(embedder, "name", DEFAULT_NAME))
 
 
 # ---------------------------------------------------------------------------
@@ -93,10 +129,15 @@ def column_text(table: TableMeta, column: ColumnMeta, include_generated: bool = 
 # ---------------------------------------------------------------------------
 
 
-class OpenAICompatibleEmbedder:
-    """Calls POST {base_url}/embeddings. Works with OpenAI and servers that copy its API."""
+class _HttpEmbedder:
+    """Batching, retries and checks shared by the HTTP embedders.
+
+    A provider supplies two things: how to build the request body (`_payload`) and the
+    path under base_url. Both providers answer with {"data": [{"index", "embedding"}, ...]}.
+    """
 
     RETRY_STATUS = {429, 500, 502, 503, 504}
+    PATH = "/embeddings"
 
     def __init__(
         self,
@@ -106,30 +147,34 @@ class OpenAICompatibleEmbedder:
         retries: int = 3,
     ) -> None:
         self.config = config
+        self.name = config.name
         self._sleep = sleep
         self._retries = retries
 
     def embed_query(self, text: str) -> list[float]:
-        return self.embed_documents([text])[0]
+        return self._embed([text], "query")[0]
 
     def embed_documents(self, texts: list[str]) -> list[list[float]]:
+        return self._embed(texts, "document")
+
+    def _embed(self, texts: list[str], kind: str) -> list[list[float]]:
         out: list[list[float]] = []
         size = self.config.batch_size
         for i in range(0, len(texts), size):
-            out.extend(self._embed_batch(texts[i : i + size]))
+            out.extend(self._embed_batch(texts[i : i + size], kind))
         return out
 
-    def _embed_batch(self, texts: list[str]) -> list[list[float]]:
-        payload: dict[str, Any] = {"model": self.config.model, "input": texts}
-        if self.config.send_dimensions:
-            payload["dimensions"] = self.config.dimensions
+    def _payload(self, texts: list[str], kind: str) -> dict[str, Any]:
+        raise NotImplementedError
+
+    def _embed_batch(self, texts: list[str], kind: str) -> list[list[float]]:
         headers = {"Content-Type": "application/json"}
         key = self.config.api_key
         if key is not None:
             headers["Authorization"] = f"Bearer {key.get_secret_value()}"
         request = urllib.request.Request(
-            self.config.base_url.rstrip("/") + "/embeddings",
-            data=json.dumps(payload).encode(),
+            self.config.base_url.rstrip("/") + self.PATH,
+            data=json.dumps(self._payload(texts, kind)).encode(),
             headers=headers,
             method="POST",
         )
@@ -144,8 +189,9 @@ class OpenAICompatibleEmbedder:
         for v in vectors:
             if len(v) != self.config.dimensions:
                 raise EmbeddingError(
-                    f"the model returned {len(v)}-dimensional vectors but config says dimensions: "
-                    f"{self.config.dimensions}"
+                    f"{self.config.model} returned {len(v)}-dimensional vectors but config says dimensions: "
+                    f"{self.config.dimensions}. Fix the number, or set send_dimensions: true if the model "
+                    f"can return shorter vectors."
                 )
         return vectors
 
@@ -168,14 +214,46 @@ class OpenAICompatibleEmbedder:
         raise AssertionError("unreachable")  # pragma: no cover
 
 
+class OpenAICompatibleEmbedder(_HttpEmbedder):
+    """POST {base_url}/embeddings in OpenAI's format. Works with OpenAI and servers that copy its API."""
+
+    def _payload(self, texts: list[str], kind: str) -> dict[str, Any]:
+        payload: dict[str, Any] = {"model": self.config.model, "input": texts}
+        if self.config.send_dimensions:
+            payload["dimensions"] = self.config.dimensions
+        return payload  # OpenAI embeds queries and documents the same way
+
+
+class VoyageEmbedder(_HttpEmbedder):
+    """POST {base_url}/embeddings in Voyage AI's format.
+
+    Voyage embeds a search query and a stored document differently, so every request says
+    which it is (`input_type`). Shortened vectors are requested with `output_dimension`.
+    """
+
+    def _payload(self, texts: list[str], kind: str) -> dict[str, Any]:
+        payload: dict[str, Any] = {"model": self.config.model, "input": texts, "input_type": kind}
+        if self.config.send_dimensions:
+            payload["output_dimension"] = self.config.dimensions
+        return payload
+
+
+EMBEDDERS: dict[str, type[_HttpEmbedder]] = {"openai": OpenAICompatibleEmbedder, "voyage": VoyageEmbedder}
+
+
+def make_embedder(config: EmbeddingConfig, **kwargs: Any) -> Embedder:
+    """The embedder for a config's provider."""
+    return EMBEDDERS[config.provider](config, **kwargs)
+
+
 def get_embedder() -> Embedder:
     """The embedder named by the `embedding:` section of config.yml."""
     cfg = get_config().embedding
     if cfg is None:
         raise RuntimeError(
-            "config.yml has no 'embedding' section (model, dimensions, ...); see config.example.yml"
+            "config.yml has no 'embedding' section (provider, model, dimensions, ...); see config.example.yml"
         )
-    return OpenAICompatibleEmbedder(cfg)
+    return make_embedder(cfg)
 
 
 # ---------------------------------------------------------------------------
@@ -183,31 +261,34 @@ def get_embedder() -> Embedder:
 # ---------------------------------------------------------------------------
 
 
-def index_statements(dimensions: int) -> list[str]:
+def index_statements(dimensions: int, name: str = DEFAULT_NAME) -> list[str]:
     """Cypher to create both indexes. The dimension is checked and written into the text
     because index options cannot always be passed as parameters."""
     if not isinstance(dimensions, int) or isinstance(dimensions, bool) or not 1 <= dimensions <= 4096:
         raise ValueError(f"dimensions must be an integer from 1 to 4096, got {dimensions!r}")
+    names = embedding_names(name)
     options = f"OPTIONS {{indexConfig: {{`vector.dimensions`: {dimensions}, `vector.similarity_function`: 'cosine'}}}}"
     return [
-        f"CREATE VECTOR INDEX {TABLE_INDEX} IF NOT EXISTS FOR (n:Table) ON (n.{EMBEDDING_PROP}) {options}",
-        f"CREATE VECTOR INDEX {COLUMN_INDEX} IF NOT EXISTS FOR (n:Column) ON (n.{EMBEDDING_PROP}) {options}",
+        f"CREATE VECTOR INDEX {names.table_index} IF NOT EXISTS FOR (n:Table) ON (n.{names.prop}) {options}",
+        f"CREATE VECTOR INDEX {names.column_index} IF NOT EXISTS FOR (n:Column) ON (n.{names.prop}) {options}",
     ]
 
 
-def create_vector_indexes(dimensions: int, session: Any | None = None) -> None:
-    """Create the table and column vector indexes (cosine). Safe to run repeatedly.
+def create_vector_indexes(dimensions: int, session: Any | None = None, name: str = DEFAULT_NAME) -> None:
+    """Create the table and column vector indexes (cosine) for one set of vectors. Safe to repeat.
 
-    An existing index keeps its original dimension: if you change embedding models,
-    call `drop_vector_indexes` first, then re-run `embed_nodes` for every database.
+    An existing index keeps its original dimension: if you change a model's dimensions,
+    call `drop_vector_indexes` for that name first, then re-run `embed_nodes` for every database.
+    Dimensions above 2048 need Neo4j 5.18 or later.
     """
-    statements = index_statements(dimensions)
+    statements = index_statements(dimensions, name)
     with use_session(session) as s:
         for statement in statements:
             s.run(statement).consume()
 
 
-def drop_vector_indexes(session: Any | None = None) -> None:
+def drop_vector_indexes(session: Any | None = None, name: str = DEFAULT_NAME) -> None:
+    names = embedding_names(name)
     with use_session(session) as s:
-        for name in (TABLE_INDEX, COLUMN_INDEX):
-            s.run(f"DROP INDEX {name} IF EXISTS").consume()
+        for index in (names.table_index, names.column_index):
+            s.run(f"DROP INDEX {index} IF EXISTS").consume()

@@ -61,19 +61,22 @@ def retrieve_seed_tables(
     session: Any | None = None,
     candidates: int = DEFAULT_CANDIDATES,
     min_score: float | None = None,
+    name: str | None = None,
 ) -> list[SeedTable]:
     """The k tables most related to `question`, best first. Fewer if the database has fewer.
 
-    min_score drops weaker hits (Neo4j cosine scores run 0 to 1). Raises
+    min_score drops weaker hits (Neo4j cosine scores run 0 to 1). The search uses the vectors stored
+    under the embedder's `name` (or `name` given here), which must be the model that embedded the nodes. Raises
     EmbeddingError if the embedding service fails; an empty question gives [].
     """
     if k <= 0 or not question.strip():
         return []
     embedder = embedder or vector.get_embedder()
+    names = vector.names_for(embedder, name)
     vec = embedder.embed_query(question)
     with use_session(session) as s:
-        tables = read(s, TABLE_HITS, index=vector.TABLE_INDEX, n=candidates, vector=vec, db_id=db_id)
-        columns = read(s, COLUMN_HITS, index=vector.COLUMN_INDEX, n=candidates * COLUMN_FACTOR, vector=vec, db_id=db_id)
+        tables = read(s, TABLE_HITS, index=names.table_index, n=candidates, vector=vec, db_id=db_id)
+        columns = read(s, COLUMN_HITS, index=names.column_index, n=candidates * COLUMN_FACTOR, vector=vec, db_id=db_id)
     seeds = rollup(tables, columns, k)
     if min_score is not None:
         seeds = [s_ for s_ in seeds if s_.score >= min_score]

@@ -17,7 +17,7 @@ downstream reads that file's shape (`schemagraph/models.py`), so changes to it n
 | Person | Slice | Where | Status |
 | --- | --- | --- | --- |
 | **Emmanuel** | Postgres access, metadata extraction, relationship inference, evaluation harness | `schemagraph/db/`, `schemagraph/extraction/`, `schemagraph/eval/`, `scripts/` | Postgres access, extraction and inference built and tested. Evaluation code written and tested with fakes: `compare.py`, `schema_metrics.py`, `run_eval.py` (it needs `answer_question`, and the question files, to run for real). `infer_recovery.py` also exists |
-| **Cameron** | Graph: weights, ingest, retrieval, join planner, graph queries | `schemagraph/graph/` | `weights`, `driver`, `ingest`, `queries`, `planner` written; Cypher needs a first run on a real Neo4j. Retrieval and enrichment not started |
+| **Cameron** | Graph: weights, ingest, retrieval, join planner, graph queries | `schemagraph/graph/` | `weights`, `driver`, `ingest`, `queries`, `planner` written; Cypher needs a first run on a real Neo4j. Retrieval and embeddings written (not yet run on a real Neo4j); description generation not started |
 | **Mohammed** | LLM pipeline and FastAPI | `schemagraph/pipeline/`, `schemagraph/api/` | SQL validation implemented; the rest is not started |
 | **Davin** | React frontend | `frontend/` | Not started |
 
@@ -312,6 +312,28 @@ Two rules hold the pieces together:
 | `scripts/` | Role creation and the two data loaders. |
 | `contracts/examples/` | Example data files that teammates can build against. |
 | `tests/` | Everything below. |
+
+## Embedding models and retrieval
+
+`graph/retrieve.py` finds the tables a question is about by vector search, so it needs an embedding model.
+`graph/enrich.py` (`embed_nodes`) stores a vector on every table and column node, and `retrieve_seed_tables` searches them.
+Set the model in the `embedding:` section of `config.yml` (commented examples are in the file).
+
+| `provider` | Models | Key variable | Notes |
+| --- | --- | --- | --- |
+| `openai` | `text-embedding-3-large`, `-3-small`, or any OpenAI-style server (Ollama, vLLM) | `OPENAI_API_KEY` | `send_dimensions: true` makes OpenAI return shortened vectors. Use `api_key_env: null` for a local server |
+| `voyage` (or `anthropic`) | `voyage-4`, `voyage-4-large`, `voyage-4-lite`, `voyage-code-4` | `VOYAGE_API_KEY` | Anthropic has no embedding model of its own and recommends Voyage AI, so `anthropic` is another name for `voyage`. Voyage embeds queries and documents differently; the code sets that for you |
+
+- **`dimensions` must match the model.** The code checks every response and says so if it does not. The vector index has the
+  same dimension (Neo4j allows 1 to 4096; above 2048 needs Neo4j 5.18 or later).
+- **One model per set of vectors.** Vectors from different models cannot be compared. To change model or dimensions: call
+  `vector.drop_vector_indexes()`, then `vector.create_vector_indexes(<dimensions>)`, then run `embed_nodes` again for every database.
+- **Two models in one graph.** Give each its own `name` in the config (for example `name: voyage`). Indexes and vectors are stored
+  per name (`table_embedding_voyage`, property `embedding_voyage`), the default name keeps the plain ones, and
+  `embed_nodes` and `retrieve_seed_tables` use the name of the embedder you pass. Switch with `SCHEMAGRAPH_CONFIG`, or
+  construct both with `vector.make_embedder(cfg)`. This lets you compare models on the same questions.
+- Retrieval Cypher (`db.index.vector.queryNodes`) needs Neo4j 5.13 or later and has not yet been run on a real server:
+  `SG_TEST_NEO4J=1 pytest tests/test_retrieve_neo4j.py`.
 
 ## Running the evaluation
 

@@ -18,3 +18,27 @@ neo4j:
   user: neo4j
   password_env: NEO4J_PASSWORD
   database: neo4j
+
+# Needed by graph/enrich.py (embed_nodes) and graph/retrieve.py. Uncomment one block.
+# The model and dimensions are the team's choice; dimensions must match the model and the
+# vector index. Changing either later means dropping the indexes and re-embedding.
+#
+# OpenAI (or any OpenAI-style server, e.g. Ollama's http://localhost:11434/v1 with api_key_env: null):
+# embedding:
+#   provider: openai
+#   model: text-embedding-3-large
+#   dimensions: 1024
+#   send_dimensions: true            # asks OpenAI for shortened vectors; without it you get 3072
+#   # api_key_env: OPENAI_API_KEY    # the default for openai
+#
+# Anthropic has no embedding model of its own and recommends Voyage AI, so `anthropic` means Voyage.
+# embedding:
+#   provider: voyage                 # or: anthropic
+#   model: voyage-4
+#   dimensions: 1024                 # voyage-4 default; 256, 512 and 2048 also exist (needs send_dimensions: true)
+#   # api_key_env: VOYAGE_API_KEY    # the default for voyage
+#   # base_url: https://ai.mongodb.com/v1   # Voyage's current endpoint; keys issued by voyageai.com may need https://api.voyageai.com/v1
+#
+# To keep two models in one graph (for example to compare them), give each its own `name`
+# and switch between configs with SCHEMAGRAPH_CONFIG. Vectors and indexes are stored per name.
+#   name: voyage

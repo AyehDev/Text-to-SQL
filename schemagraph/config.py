@@ -17,7 +17,7 @@ from typing import Literal
 
 import yaml
 from psycopg.conninfo import make_conninfo
-from pydantic import BaseModel, ConfigDict, Field, SecretStr
+from pydantic import BaseModel, ConfigDict, Field, SecretStr, field_validator, model_validator
 
 DEFAULT_CONFIG_PATH = "config.yml"
 CONFIG_PATH_ENV = "SCHEMAGRAPH_CONFIG"
@@ -107,23 +107,60 @@ class Neo4jConfig(BaseModel):
         return SecretStr(value)
 
 
-class EmbeddingConfig(BaseModel):
-    """Text embeddings for retrieval, from any server with an OpenAI-style /embeddings endpoint.
+EMBEDDING_PROVIDERS = {
+    # provider: (default base_url, default api key variable)
+    "openai": ("https://api.openai.com/v1", "OPENAI_API_KEY"),
+    "voyage": ("https://ai.mongodb.com/v1", "VOYAGE_API_KEY"),
+}
+PROFILE_NAME_RE = re.compile(r"^[a-z][a-z0-9_]{0,30}$")
 
-    That covers OpenAI itself and most local servers (e.g. Ollama's /v1). Code only
-    depends on the Embedder interface in graph/vector.py, so a different provider
-    can replace this without touching retrieval.
+
+class EmbeddingConfig(BaseModel):
+    """Which embedding model to use for retrieval, and how to reach it.
+
+    provider
+        `openai`: OpenAI, or any server with an OpenAI-style /embeddings endpoint
+        (Ollama's /v1, vLLM, ...). `voyage`: Voyage AI. Anthropic has no embedding model
+        of its own and recommends Voyage, so `anthropic` is accepted as another name
+        for `voyage`.
+    name
+        Names this set of vectors in Neo4j. The default keeps the plain index and property
+        names; any other name adds a suffix, so vectors from different models can sit
+        side by side in one graph and be compared (see graph/vector.py).
+
+    Defaults for base_url and api_key_env depend on the provider. Set `api_key_env: null`
+    for a local server that needs no key.
     """
 
     model_config = ConfigDict(extra="forbid")
 
-    base_url: str = "https://api.openai.com/v1"
+    provider: Literal["openai", "voyage", "anthropic"] = "openai"
+    name: str = "default"
+    base_url: str | None = None            # default: the provider's public endpoint
     model: str
     dimensions: int = Field(ge=1)          # must match the vector index; changing it means re-embedding
-    api_key_env: str | None = "OPENAI_API_KEY"   # None for a local server that needs no key
-    send_dimensions: bool = False          # OpenAI's v3 models can shorten vectors; most servers reject the field
+    api_key_env: str | None = None         # default: OPENAI_API_KEY / VOYAGE_API_KEY; null means no key
+    send_dimensions: bool = False          # ask the API for shortened vectors (OpenAI v3, Voyage 4 support it)
     batch_size: int = Field(default=64, ge=1)
     timeout_s: float = Field(default=30.0, gt=0)
+
+    @field_validator("name")
+    @classmethod
+    def _valid_name(cls, value: str) -> str:
+        if not PROFILE_NAME_RE.match(value):
+            raise ValueError("name must be lowercase letters, digits and _, starting with a letter (max 31)")
+        return value
+
+    @model_validator(mode="after")
+    def _provider_defaults(self) -> "EmbeddingConfig":
+        if self.provider == "anthropic":
+            self.provider = "voyage"
+        base_url, key_env = EMBEDDING_PROVIDERS[self.provider]
+        if self.base_url is None:
+            self.base_url = base_url
+        if "api_key_env" not in self.model_fields_set:  # an explicit null stays null
+            self.api_key_env = key_env
+        return self
 
     @property
     def api_key(self) -> SecretStr | None:

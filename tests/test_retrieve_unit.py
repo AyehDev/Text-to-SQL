@@ -6,6 +6,7 @@ nodes of every db_id sit in the same index, so top-n comes before the db_id filt
 
 import json
 import math
+import re
 import threading
 import zlib
 from http.server import BaseHTTPRequestHandler, HTTPServer
@@ -86,16 +87,18 @@ class FakeVectorStore:
         if query.startswith("UNWIND $rows"):
             label = "Table" if "(n:Table" in query else "Column"
             store = self.tables if label == "Table" else self.columns
+            prop = re.search(r"SET n\.(\w+) = row\.vec", query).group(1)
             for row in params["rows"]:
-                store[row["uid"]]["embedding"] = row["vec"]
+                store[row["uid"]][prop] = row["vec"]
             return self
         if "queryNodes" in query:
             if params["index"] == vector.TABLE_INDEX:
                 nodes, is_col = self.tables, False
             else:
                 nodes, is_col = self.columns, True
+            prop = params["index"].split("_", 1)[1]   # table_embedding[_name] -> embedding[_name]
             scored = sorted(
-                ((cosine01(p["embedding"], params["vector"]), uid) for uid, p in nodes.items() if "embedding" in p),
+                ((cosine01(p[prop], params["vector"]), uid) for uid, p in nodes.items() if prop in p),
                 key=lambda x: (-x[0], x[1]),
             )[: params["n"]]  # top n over ALL databases, then the db_id filter
             out = []
