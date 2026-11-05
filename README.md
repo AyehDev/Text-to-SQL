@@ -18,7 +18,7 @@ downstream reads that file's shape (`schemagraph/models.py`), so changes to it n
 | --- | --- | --- | --- |
 | **Emmanuel** | Postgres access, metadata extraction, relationship inference, evaluation harness | `schemagraph/db/`, `schemagraph/extraction/`, `schemagraph/eval/`, `scripts/` | Postgres access, extraction and inference built and tested. Evaluation harness (`compare.py`, `schema_metrics.py`, `run_eval.py`) not started; only `infer_recovery.py` exists |
 | **Cameron** | Graph: weights, ingest, retrieval, join planner, graph queries | `schemagraph/graph/` | `weights`, `driver`, `ingest`, `queries`, `planner` written; Cypher needs a first run on a real Neo4j. Retrieval and enrichment not started |
-| **Mohammed** | LLM pipeline and FastAPI | `schemagraph/pipeline/`, `schemagraph/api/` | Not started |
+| **Mohammed** | LLM pipeline and FastAPI | `schemagraph/pipeline/`, `schemagraph/api/` | SQL validation implemented; the rest is not started |
 | **Davin** | React frontend | `frontend/` | Not started |
 
 The full design is in `SPEC.md`. Section numbers quoted in the code (3 for contracts, 5.6 for edge
@@ -299,7 +299,8 @@ Two rules hold the pieces together:
 | --- | --- |
 | `schemagraph/models.py` | Every shared data contract, plus the UID helpers. Change with care. |
 | `schemagraph/config.py` | YAML config, the two Postgres roles, connection strings, Neo4j settings. |
-| `schemagraph/db/postgres.py` | The only code that talks to Postgres: read-only queries, `explain`, admin queries. |
+| `schemagraph/db/` | Public PostgreSQL API: `list_databases`, `run_readonly_query`, `explain`, and `run_admin_query`; implementation is in `postgres.py`. |
+| `schemagraph/sql_validation.py` | PostgreSQL-dialect check that accepts one read-only `SELECT` and rejects writes or multiple statements. |
 | `schemagraph/extraction/sql/*.sql` | Catalog queries: tables, columns, primary keys, foreign keys, unique constraints. |
 | `schemagraph/extraction/extract.py` | Turns those results into `DatabaseMetadata`; saves and loads the JSON. |
 | `schemagraph/extraction/infer.py` | Finds relationships the database does not declare: name and type fit, confirmed by value overlap. |

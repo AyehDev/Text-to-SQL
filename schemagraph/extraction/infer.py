@@ -39,7 +39,7 @@ from typing import NamedTuple
 import psycopg
 from psycopg import sql as pgsql
 
-from schemagraph.db import postgres as db
+from schemagraph import db
 from schemagraph.extraction import extract
 from schemagraph.models import (
     CandidatePair,

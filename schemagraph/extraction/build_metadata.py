@@ -17,7 +17,7 @@ import time
 from dataclasses import dataclass
 from pathlib import Path
 
-from schemagraph.db import postgres as db
+from schemagraph import db
 from schemagraph.extraction import extract, infer
 from schemagraph.models import DatabaseMetadata
 
