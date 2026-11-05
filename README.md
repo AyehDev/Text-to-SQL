@@ -16,7 +16,7 @@ downstream reads that file's shape (`schemagraph/models.py`), so changes to it n
 
 | Person | Slice | Where | Status |
 | --- | --- | --- | --- |
-| **Emmanuel** | Postgres access, metadata extraction, relationship inference, evaluation harness | `schemagraph/db/`, `schemagraph/extraction/`, `schemagraph/eval/`, `scripts/` | Postgres access, extraction and inference built and tested. Evaluation harness (`compare.py`, `schema_metrics.py`, `run_eval.py`) not started; only `infer_recovery.py` exists |
+| **Emmanuel** | Postgres access, metadata extraction, relationship inference, evaluation harness | `schemagraph/db/`, `schemagraph/extraction/`, `schemagraph/eval/`, `scripts/` | Postgres access, extraction and inference built and tested. Evaluation code written and tested with fakes: `compare.py`, `schema_metrics.py`, `run_eval.py` (it needs `answer_question`, and the question files, to run for real). `infer_recovery.py` also exists |
 | **Cameron** | Graph: weights, ingest, retrieval, join planner, graph queries | `schemagraph/graph/` | `weights`, `driver`, `ingest`, `queries`, `planner` written; Cypher needs a first run on a real Neo4j. Retrieval and enrichment not started |
 | **Mohammed** | LLM pipeline and FastAPI | `schemagraph/pipeline/`, `schemagraph/api/` | SQL validation implemented; the rest is not started |
 | **Davin** | React frontend | `frontend/` | Not started |
@@ -82,9 +82,9 @@ weights, 7 for the two Postgres roles) refer to it.
 
 ### If you are Emmanuel (extraction)
 
-Details are in "What each folder does" below. Open items: the question-answering evaluation harness
-(SPEC 5.18 to 5.20: `results_match`, schema metrics, `run_eval.py`), the held-out inference test on BIRD,
-`.env` loading for passwords, and the database-wrapper abstraction (deferred on purpose).
+Details are in "What each folder does" below. The evaluation code (SPEC 5.18 to 5.20) is written; see "Running the
+evaluation" under Testing. Open items: writing the question files (`eval/questions/*.jsonl`), the held-out inference
+test on BIRD, `.env` loading for passwords, and the database-wrapper abstraction (deferred on purpose).
 
 ## Setup
 
@@ -310,6 +310,24 @@ Two rules hold the pieces together:
 | `scripts/` | Role creation and the two data loaders. |
 | `contracts/examples/` | Example data files that teammates can build against. |
 | `tests/` | Everything below. |
+
+## Running the evaluation
+
+```bash
+pip install -e '.[eval]'     # pandas, only needed for run_eval.summarize()
+python -m schemagraph.eval.run_eval --questions schemagraph/eval/questions/adventureworks.jsonl --check-gold
+python -m schemagraph.eval.run_eval --questions schemagraph/eval/questions/adventureworks.jsonl \
+    --modes full retrieval graph --out results/RUN.jsonl --run-id RUN --llm-model <model>
+python -m schemagraph.eval.run_eval --summarize results/RUN.jsonl
+```
+
+`--check-gold` runs every gold query first and reports failures and queries that return no rows; a real run does the
+same check before any model call. A run is resumable: repeat the command with the same `--run-id` and finished rows are
+skipped. Ablations: `--no-inferred`, `--unweighted` (passed to `answer_question` as `planner_options`).
+
+How answers are judged (`eval/compare.py`): results are compared as sets of rows, ignoring column names and column
+order, ignoring row order unless the question sets `order_matters`, and comparing numbers by value. Different rounding is
+a different answer, and a truncated result never matches, so gold queries must return fewer than 100,000 rows.
 
 ## Testing
 

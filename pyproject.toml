@@ -17,6 +17,7 @@ dependencies = [
 
 [project.optional-dependencies]
 dev = ["pytest>=8"]
+eval = ["pandas>=2"]  # only for run_eval.summarize(); the command-line summary does not need it
 
 [tool.setuptools.packages.find]
 include = ["schemagraph*"]
