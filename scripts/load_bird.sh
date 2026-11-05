@@ -14,7 +14,10 @@
 #        A. the dump created databases itself      -> used as they are
 #        B. the dump uses one schema per database  -> each schema is copied
 #                                                     into its own database
-#        C. anything else                          -> stops and prints what it
+#        C. every table is in staging's "public"   -> split by scripts/bird_tables.tsv
+#           (the mini-dev PostgreSQL dump does this)  (db_id <TAB> table), after checking
+#                                                     the file against the real tables
+#        D. anything else                          -> stops and prints what it
 #                                                     found, touching nothing more
 #   4. runs scripts/create_roles.sql, ANALYZE, and checks sg_readonly on each
 #   5. copies mini_dev_postgresql.json (the questions) next to the data, if found
@@ -26,6 +29,9 @@
 #   --zip PATH       minidev.zip you downloaded (default: download it)
 #   --url URL        where to download minidev.zip from
 #   --staging NAME   staging database                 (default: bird_staging)
+#   --from-staging   skip the download and load: split the staging database that is
+#                    already there (it is kept, so you can rerun this)
+#   --mapping FILE   table-to-database list for layout C (default: scripts/bird_tables.tsv)
 #   --keep-staging   do not drop the staging database at the end
 #   --questions DIR  copy mini_dev_postgresql.json here   (default: data/bird)
 #   --skip-roles     do not create/grant sg_admin and sg_readonly
@@ -50,6 +56,8 @@ KEEP_STAGING=0
 QUESTIONS_DIR="data/bird"
 SKIP_ROLES=0
 FORCE=0
+FROM_STAGING=0
+MAPPING="$SCRIPT_DIR/bird_tables.tsv"
 
 die()  { echo "ERROR: $*" >&2; exit 1; }
 info() { echo "==> $*"; }
@@ -63,6 +71,8 @@ while [[ $# -gt 0 ]]; do
         --url)          [[ $# -ge 2 ]] || die "--url needs a value"; URL="$2";  shift 2 ;;
         --staging)      [[ $# -ge 2 ]] || die "--staging needs a name"; STAGING="$2"; shift 2 ;;
         --questions)    [[ $# -ge 2 ]] || die "--questions needs a folder"; QUESTIONS_DIR="$2"; shift 2 ;;
+        --from-staging) FROM_STAGING=1; KEEP_STAGING=1; shift ;;
+        --mapping)      [[ $# -ge 2 ]] || die "--mapping needs a file"; MAPPING="$2"; shift 2 ;;
         --keep-staging) KEEP_STAGING=1; shift ;;
         --skip-roles)   SKIP_ROLES=1;   shift ;;
         --force)        FORCE=1;        shift ;;
@@ -127,6 +137,14 @@ find_in() {   # first file named $2 under folder $1; one under a "postgres" fold
 }
 
 EXTRACTED=""
+LOG="$WORK/load.log"
+if [[ $FROM_STAGING -eq 1 ]]; then
+    db_exists "$STAGING" || die "--from-staging: database '$STAGING' does not exist (run without --from-staging to load it)"
+    : >"$LOG"
+    before="$(list_dbs | sort)"
+    info "using the existing staging database '$STAGING' (no download, no load)"
+else
+# (sections 1 and 2 below only run without --from-staging)
 if [[ -z "$DUMP" ]]; then
     if [[ -z "$ZIP" ]]; then
         command -v curl >/dev/null || die "curl not found (or download minidev.zip yourself and pass --zip)"
@@ -165,6 +183,7 @@ if [[ "$errors" -gt 0 ]]; then
     echo "    $errors error(s) while loading; kinds seen:"
     grep 'ERROR' "$LOG" | sed -E 's/^psql:[^:]*:[0-9]+: //; s/"[^"]*"/"..."/g' | sort | uniq -c | sort -rn | head -8 | sed 's/^/      /'
 fi
+fi   # end of "not --from-staging"
 
 # --------------------------------------------------------------------------
 # 3. Work out the layout
@@ -210,6 +229,59 @@ elif [[ -n "$schemas" ]]; then
         echo "    $s -> database '$d' ($n tables)"
         TARGETS+=("$d")
     done <<<"$schemas"
+elif [[ "$public_tables" -gt 0 && -f "$MAPPING" ]]; then
+    info "layout C: every table is in $STAGING.public; splitting by $MAPPING"
+    declare -A owner=()      # lowercase table name -> db_id
+    declare -A seen_db=()
+    db_order=()
+    while IFS=$'\t' read -r d t _; do
+        [[ -z "${d// /}" || "$d" == \#* ]] && continue
+        [[ "$d" =~ ^[a-z0-9_]+$ ]] || die "$MAPPING: '$d' is not a valid db_id (^[a-z0-9_]+$)"
+        [[ -n "${t:-}" ]] || die "$MAPPING: no table on the line for '$d'"
+        t="$(printf '%s' "$t" | tr '[:upper:]' '[:lower:]')"
+        [[ -z "${owner[$t]:-}" ]] || die "$MAPPING: table '$t' is listed under both '${owner[$t]}' and '$d'"
+        owner[$t]="$d"
+        if [[ -z "${seen_db[$d]:-}" ]]; then seen_db[$d]=1; db_order+=("$d"); fi
+    done <"$MAPPING"
+
+    mapfile -t actual < <(pg -d "$STAGING" -Atq -c "SELECT c.relname FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace WHERE n.nspname = 'public' AND c.relkind IN ('r','p') ORDER BY 1")
+    declare -A present=()
+    unassigned=()
+    for name in "${actual[@]}"; do
+        low="$(printf '%s' "$name" | tr '[:upper:]' '[:lower:]')"
+        present[$low]=1
+        [[ -n "${owner[$low]:-}" ]] || unassigned+=("$name")
+    done
+    missing=()
+    for low in "${!owner[@]}"; do [[ -n "${present[$low]:-}" ]] || missing+=("$low"); done
+    if [[ ${#unassigned[@]} -gt 0 || ${#missing[@]} -gt 0 ]]; then
+        echo "STOP: $MAPPING does not match the tables in $STAGING.public. Nothing was split." >&2
+        echo "  in $STAGING but not in the mapping (${#unassigned[@]}): ${unassigned[*]:-none}" >&2
+        echo "  in the mapping but not in $STAGING (${#missing[@]}): ${missing[*]:-none}" >&2
+        echo "  Fix the mapping file (one 'db_id<TAB>table' line per table) and rerun with --from-staging." >&2
+        exit 2
+    fi
+
+    for d in "${db_order[@]}"; do
+        args=()
+        names=()
+        for name in "${actual[@]}"; do
+            low="$(printf '%s' "$name" | tr '[:upper:]' '[:lower:]')"
+            if [[ "${owner[$low]}" == "$d" ]]; then args+=(-t "public.\"$name\""); names+=("$name"); fi
+        done
+        create_db "$d"
+        pg_dump -w --no-owner --no-privileges "${args[@]}" "$STAGING" | psql -X -w -q -d "$d" -o /dev/null 2>>"$LOG" || true
+        # every table must have arrived with every row
+        for name in "${names[@]}"; do
+            want="$(pg -d "$STAGING" -Atq -c "SELECT count(*) FROM public.\"$name\"")"
+            got="$(pg -d "$d" -Atq -c "SELECT count(*) FROM public.\"$name\"" 2>/dev/null)" \
+                || die "table '$name' is missing from '$d' after the copy. Load log tail:
+$(tail -5 "$LOG")"
+            [[ "$got" == "$want" ]] || die "table '$name' in '$d' has $got rows; staging has $want"
+        done
+        echo "    -> database '$d' (${#names[@]} tables)"
+        TARGETS+=("$d")
+    done
 else
     echo "STOP: layout not recognised. Nothing was split." >&2
     echo "  new databases created by the dump : none" >&2
@@ -278,6 +350,9 @@ if [[ -n "$EXTRACTED" ]]; then
     else
         echo "note: mini_dev_postgresql.json was not in the zip; copy it into $QUESTIONS_DIR yourself" >&2
     fi
+elif [[ $FROM_STAGING -eq 1 ]]; then
+    echo "note: --from-staging does not look for the questions file. Put mini_dev_postgresql.json in $QUESTIONS_DIR (see the README)." >&2
+    echo "      The staging database '$STAGING' was kept; drop it when you are happy:  psql -d postgres -c 'DROP DATABASE $STAGING'" >&2
 else
     echo "note: --dump was used, so the questions file was not looked for. Copy mini_dev_postgresql.json into $QUESTIONS_DIR" >&2
 fi

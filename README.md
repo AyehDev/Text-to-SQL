@@ -83,7 +83,7 @@ weights, 7 for the two Postgres roles) refer to it.
 ### If you are Emmanuel (extraction)
 
 Details are in "What each folder does" below. The evaluation code (SPEC 5.18 to 5.20) is written; see "Running the
-evaluation" under Testing. Open items: writing the question files (`eval/questions/*.jsonl`), the held-out inference
+evaluation" under Testing. Open items: the AdventureWorks question file and the few-shot file (`eval/questions/`), the held-out inference
 test on BIRD, `.env` loading for passwords, and the database-wrapper abstraction (deferred on purpose).
 
 ## Setup
@@ -151,7 +151,17 @@ scripts/load_adventureworks.sh --repo ./adventureworks-for-postgres
 # BIRD mini-dev. Download minidev.zip first (table above), then:
 scripts/load_bird.sh --zip ~/Downloads/minidev.zip
 # if the dump layout is not recognised the script stops and prints the table list; send that to Emmanuel
+
+# Already have every BIRD table in one database (`bird_staging`, all in schema public)? Skip the download and
+# split it into one database per db_id using scripts/bird_tables.tsv:
+PG_ADMIN_PASSWORD=... PG_READONLY_PASSWORD=... scripts/load_bird.sh --from-staging --force
 ```
+
+The BIRD mini-dev dump puts all 11 databases' tables into a single schema. `load_bird.sh` splits them with
+`scripts/bird_tables.tsv` (one `db_id<TAB>table` line per table). Before splitting it compares that file with the
+real tables and stops (exit 2, nothing changed) if they differ, so edit the file rather than the script. After the
+split it checks each table's row count against staging. `--force` drops and recreates the per-db databases;
+`bird_staging` is kept until you drop it.
 
 Both scripts create lowercase UTF8 databases, run `scripts/create_roles.sql`, run `ANALYZE` and check that
 `sg_readonly` can read but not write. A database loaded any other way needs
@@ -344,6 +354,26 @@ python -m schemagraph.eval.run_eval --questions schemagraph/eval/questions/adven
     --modes full retrieval graph --out results/RUN.jsonl --run-id RUN --llm-model <model>
 python -m schemagraph.eval.run_eval --summarize results/RUN.jsonl
 ```
+
+### Building the question files
+
+`bird_subset.jsonl` is generated from BIRD's own questions (the `mini_dev_postgresql.json` that `scripts/load_bird.sh` copies
+to `data/bird/`), not written by hand:
+
+```bash
+python -m schemagraph.eval.bird_questions --input data/bird/mini_dev_postgresql.json \
+    --out schemagraph/eval/questions/bird_subset.jsonl --verify      # --verify needs the BIRD databases loaded
+python -m schemagraph.eval.question_set schemagraph/eval/questions/*.jsonl      # checks any question files
+```
+
+It keeps 50 `test` and 10 `dev` questions by default (`--n-test`, `--n-dev`), spread over the databases and mixed 20/40/40
+across tiers 1/2/3 (`--tier-mix`), chosen reproducibly from `--seed`. BIRD databases have a single schema, so the spec's
+tier 3 (cross-schema) cannot occur; here a question's tier is the number of distinct tables in its gold query (1, 2, or 3
+and more). `order_matters` is set when the gold query has a top-level `ORDER BY` and no `LIMIT 1` (stricter than BIRD's own
+scorer, which ignores row order); those questions say so in `notes`. `--verify` runs every gold query first and drops those
+that fail, time out, or return no rows. `question_set.py` also catches duplicate ids and questions, gold SQL that is not
+a single safe SELECT, and any overlap with `fewshot_examples.jsonl` (`--fewshot`). The questions not chosen are a pool for
+few-shot examples.
 
 `--check-gold` runs every gold query first and reports failures and queries that return no rows; a real run does the
 same check before any model call. A run is resumable: repeat the command with the same `--run-id` and finished rows are
