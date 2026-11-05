@@ -52,9 +52,8 @@ weights, 7 for the two Postgres roles) refer to it.
   `weighted=False`), drops the weakest seed when a plan needs more than 4 bridge tables, and returns runner-up
   `alternatives`. It never raises for "no path". It reads edges through `queries.get_reference_edges`, so the search
   itself runs and is tested without Neo4j. GDS is not used; `gds_steiner` stays in the contract for later.
-- **Still to build:** `enrich.py` (descriptions, embeddings, vector indexes), `retrieve.py` (SPEC 5.7, 5.9), and
-  `scripts/build_graph.py`. `build_metadata` already covers its first three steps
-  (extract, infer, save); the rest of its flow is ingest, weights, enrichment, embeddings, verify.
+- **Still to build:** `enrich.generate_missing_descriptions`. `scripts/build_graph.py` runs the rest of the flow
+  (extract, infer, save, ingest, weights, vector indexes, embeddings, verify).
 
 ### If you are Mohammed (pipeline and API)
 
@@ -175,6 +174,22 @@ python -m schemagraph.graph.ingest --db adventureworks --rebuild        # loads 
 ```
 
 `build_metadata` accepts `--all`, repeated `--db`, and `--skip-inference`.
+
+To do everything in one command (extract, infer, ingest, weights, vector indexes, embeddings, verify):
+
+```bash
+python scripts/build_graph.py --db adventureworks --rebuild
+python scripts/build_graph.py --all --skip-enrichment             # no embedding model needed
+python scripts/build_graph.py --db adventureworks --skip-extraction   # reuse data/metadata/adventureworks.json
+```
+
+Before touching any database it checks that Neo4j answers and, unless `--skip-enrichment`, that the configured embedding
+model is reachable and returns vectors of the size `config.yml` says (a wrong size would leave the index silently empty).
+Those failures exit 2 with nothing changed. After that, one database failing does not stop the others; the exit code is 1 if
+any failed or the graph does not match its metadata. `--rebuild` clears each db_id's nodes first, which also removes
+its embeddings, so use it with enrichment on. If you change a model's `dimensions`, call
+`vector.drop_vector_indexes(name=...)` first, because an existing index keeps its old size. LLM-written descriptions are
+not a step yet.
 
 ## API reference
 

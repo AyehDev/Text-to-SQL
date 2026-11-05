@@ -699,7 +699,7 @@ python scripts/build_graph.py --db adventureworks [--skip-inference] [--skip-enr
 
 Runs `extract_metadata` → `infer_relationships` → `save_metadata` → `ingest_metadata` → `apply_weights` → `generate_missing_descriptions` → `create_vector_indexes` → `embed_nodes` → `verify_against_metadata`.
 
-**Not yet written.** `extraction/build_metadata.py` covers the first three steps, and `python -m schemagraph.graph.ingest` covers ingest and weights.
+**Written** (`schemagraph/graph/build.py`, run through `scripts/build_graph.py`). It also takes `--all`, repeated `--db`, `--rebuild` and `--skip-extraction`. `generate_missing_descriptions` is not a step yet. Neo4j, the embedding config and the embedding size are checked once before any database is touched (exit 2); after that one database failing does not stop the others (exit 1 if any failed or `verify_against_metadata` reports differences).
 
 ### 5.22 Frontend — Davin
 
@@ -771,7 +771,8 @@ Build against `src/mocks/ask_response.json` until the backend is ready, with a `
 | `graph/weights.py`, `driver.py`, `cypher.py`, `ingest.py`, `queries.py`, `planner.py` | Cameron | Written and tested with fakes; Cypher not yet run on a real Neo4j |
 | `graph/vector.py`, `retrieve.py`, `enrich.embed_nodes` | Cameron | Written and tested with fakes and a local HTTP server; Cypher not yet run on a real Neo4j |
 | `graph/enrich.generate_missing_descriptions` | Cameron | Not started |
-| `scripts/build_graph.py`, `export_contracts.py` | Cameron / Emmanuel | Not started |
+| `scripts/build_graph.py` | Cameron / Emmanuel | Written and tested with fakes; not yet run on a real Neo4j |
+| `export_contracts.py` | Cameron / Emmanuel | Not started |
 | `pipeline/*`, `api/main.py` | Mohammed | Not started |
 | `frontend/` | Davin | Not started |
 | `contracts/examples/`: metadata and join plan samples | | Done. `ask_response.sample.json` still to write |

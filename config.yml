@@ -24,12 +24,12 @@ neo4j:
 # vector index. Changing either later means dropping the indexes and re-embedding.
 #
 # OpenAI (or any OpenAI-style server, e.g. Ollama's http://localhost:11434/v1 with api_key_env: null):
-# embedding:
-#   provider: openai
-#   model: text-embedding-3-large
-#   dimensions: 1024
-#   send_dimensions: true            # asks OpenAI for shortened vectors; without it you get 3072
-#   # api_key_env: OPENAI_API_KEY    # the default for openai
+embedding:
+   provider: openai
+   model: text-embedding-3-large
+   dimensions: 1024
+   send_dimensions: true            # asks OpenAI for shortened vectors; without it you get 3072
+   api_key_env: OPENAI_API_KEY    # the default for openai
 #
 # Anthropic has no embedding model of its own and recommends Voyage AI, so `anthropic` means Voyage.
 # embedding:
