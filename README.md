@@ -366,6 +366,9 @@ python -m schemagraph.eval.bird_questions --input data/bird/mini_dev_postgresql.
 python -m schemagraph.eval.question_set schemagraph/eval/questions/*.jsonl      # checks any question files
 ```
 
+With `--verify`, failed gold queries are printed grouped by message. If at least half of all questions fail for one
+reason (typically "database ... does not exist"), the run exits 2 and writes nothing: fix the setup, not the questions.
+
 It keeps 50 `test` and 10 `dev` questions by default (`--n-test`, `--n-dev`), spread over the databases and mixed 20/40/40
 across tiers 1/2/3 (`--tier-mix`), chosen reproducibly from `--seed`. BIRD databases have a single schema, so the spec's
 tier 3 (cross-schema) cannot occur; here a question's tier is the number of distinct tables in its gold query (1, 2, or 3

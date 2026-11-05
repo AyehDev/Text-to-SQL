@@ -31,6 +31,7 @@ from __future__ import annotations
 import argparse
 import json
 import random
+import re
 import sys
 from collections import Counter, defaultdict
 from collections.abc import Callable
@@ -236,6 +237,7 @@ class BuildReport:
     usable: int = 0
     skipped: Skipped = field(default_factory=Skipped)
     dropped_by_gold: dict[str, str] = field(default_factory=dict)
+    candidates: int = 0
     warnings: list[str] = field(default_factory=list)
     questions: list[Question] = field(default_factory=list)
 
@@ -266,6 +268,7 @@ def build(
             seen_ids.add(result.id)
             candidates.append(result)
 
+    report.candidates = len(candidates)
     if verify is not None:
         check = verify(candidates)
         report.dropped_by_gold = dict(check.errors) | {qid: "gold SQL returns no rows" for qid in check.empty}
@@ -273,6 +276,35 @@ def build(
     report.usable = len(candidates)
     report.questions, report.warnings = choose(candidates, n_test, n_dev, tier_mix, seed)
     return report
+
+
+ABORT_SHARE = 0.5  # stop when this share of all candidates fail for one and the same reason
+_QUOTED = re.compile(r'"[^"]*"')
+
+
+def group_drops(dropped: dict[str, str]) -> list[tuple[str, list[str]]]:
+    """Group drop reasons by message (quoted names collapsed), biggest group first.
+
+    Collapsing "card_games" / "financial" into one key makes "database X does not exist" a single
+    line instead of one line per question.
+    """
+    groups: dict[str, list[str]] = {}
+    for qid, why in dropped.items():
+        groups.setdefault(_QUOTED.sub('"..."', " ".join(why.split())), []).append(qid)
+    return sorted(((why, sorted(ids)) for why, ids in groups.items()), key=lambda g: (-len(g[1]), g[0]))
+
+
+def systematic_failure(dropped: dict[str, str], candidates: int) -> str | None:
+    """The reason, if at least ABORT_SHARE of all candidates failed for the same (non-empty-result) reason.
+
+    That pattern means the environment is wrong (databases missing, bad credentials), not that the
+    questions are, and choosing a subset from the few survivors would be misleading.
+    """
+    errors = {q: w for q, w in dropped.items() if w != "gold SQL returns no rows"}
+    if not candidates or not errors:
+        return None
+    why, ids = group_drops(errors)[0]
+    return why if len(ids) >= ABORT_SHARE * candidates else None
 
 
 def write_jsonl(questions: list[Question], path: Path) -> None:
@@ -320,8 +352,15 @@ def main(argv: list[str] | None = None) -> int:
 
     for reason, n in report.skipped.reasons.items():
         print(f"  skipped {n}: {reason} (e.g. {', '.join(report.skipped.examples[reason])})")
-    for qid, why in sorted(report.dropped_by_gold.items()):
-        print(f"  dropped {qid}: {why}")
+    for why, ids in group_drops(report.dropped_by_gold):
+        shown = ", ".join(ids[:3]) + (", ..." if len(ids) > 3 else "")
+        print(f"  dropped {len(ids)}: {why} (e.g. {shown})")
+    systematic = systematic_failure(report.dropped_by_gold, report.candidates)
+    if systematic:
+        print(f"ABORTED: {len(report.dropped_by_gold)} of {report.candidates} gold queries failed, most for one "
+              f"reason:\n  {systematic}\nThat points at the setup (databases not loaded, wrong credentials), "
+              "not at the questions. Fix it and rerun; nothing was written.", file=sys.stderr)
+        return 2
     for warning in report.warnings:
         print(f"  WARNING {warning}")
     if not report.questions:

@@ -256,3 +256,46 @@ def test_cli_reports_a_bad_input(tmp_path, capsys):
 def test_cli_rejects_a_bad_tier_mix(tmp_path):
     with pytest.raises(SystemExit):
         bq.main(["--input", "x", "--tier-mix", "1,2"])
+
+
+# ----------------------------------------------------------------- failure grouping
+
+
+def test_group_drops_collapses_quoted_names_and_sorts_by_size():
+    dropped = {
+        "bird-1": 'gold SQL failed: database "card_games" does not exist',
+        "bird-2": 'gold SQL failed: database "financial" does not exist',
+        "bird-3": 'gold SQL failed: database "card_games" does not exist',
+        "bird-4": "gold SQL returns no rows",
+    }
+    groups = bq.group_drops(dropped)
+    assert groups[0] == ('gold SQL failed: database "..." does not exist', ["bird-1", "bird-2", "bird-3"])
+    assert groups[1] == ("gold SQL returns no rows", ["bird-4"])
+
+
+def test_systematic_failure_needs_a_shared_error_covering_half():
+    same = {f"bird-{i}": f'database "d{i}" does not exist' for i in range(6)}
+    assert bq.systematic_failure(same, 10) == 'database "..." does not exist'
+    assert bq.systematic_failure(same, 13) is None                       # under half of all candidates
+    mixed = {f"bird-{i}": f"error {chr(97 + i)}" for i in range(6)}
+    assert bq.systematic_failure(mixed, 6) is None                       # many different reasons
+    empty = {f"bird-{i}": "gold SQL returns no rows" for i in range(6)}
+    assert bq.systematic_failure(empty, 6) is None                       # empty results are a data matter
+    assert bq.systematic_failure({}, 0) is None
+
+
+def test_cli_aborts_without_writing_when_every_gold_query_fails(tmp_path, capsys, monkeypatch):
+    from schemagraph.eval import run_eval
+
+    def all_fail(questions):
+        return SimpleNamespace(results={}, errors={q.id: f'connection failed: database "{q.db_id}" does not exist'
+                                                   for q in questions}, empty=[])
+
+    monkeypatch.setattr(run_eval, "check_gold", all_fail)
+    src, out = tmp_path / "mini.json", tmp_path / "q.jsonl"
+    src.write_text(json.dumps(sample_items(10)))
+    assert bq.main(["--input", str(src), "--out", str(out), "--verify"]) == 2
+    captured = capsys.readouterr()
+    assert "ABORTED" in captured.err and 'database "..." does not exist' in captured.err
+    assert captured.out.count("dropped 30") == 1                         # one grouped line, not thirty
+    assert not out.exists()
