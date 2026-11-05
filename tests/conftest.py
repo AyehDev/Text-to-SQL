@@ -21,12 +21,16 @@ FIXTURES = Path(__file__).parent / "fixtures"
 
 
 def pytest_collection_modifyitems(config, items):
-    if os.environ.get("SG_TEST_PG_DSN"):
-        return
-    skip = pytest.mark.skip(reason="SG_TEST_PG_DSN not set")
+    no_dsn = pytest.mark.skip(reason="SG_TEST_PG_DSN not set")
+    no_aw = pytest.mark.skip(reason="SG_TEST_ADVENTUREWORKS not set")
+    no_neo = pytest.mark.skip(reason="SG_TEST_NEO4J not set")
     for item in items:
-        if "integration" in item.keywords:
-            item.add_marker(skip)
+        if "integration" in item.keywords and not os.environ.get("SG_TEST_PG_DSN"):
+            item.add_marker(no_dsn)
+        if "adventureworks" in item.keywords and not os.environ.get("SG_TEST_ADVENTUREWORKS"):
+            item.add_marker(no_aw)
+        if "neo4j" in item.keywords and not os.environ.get("SG_TEST_NEO4J"):
+            item.add_marker(no_neo)
 
 
 @pytest.fixture(scope="session")

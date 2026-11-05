@@ -107,6 +107,34 @@ class Neo4jConfig(BaseModel):
         return SecretStr(value)
 
 
+class EmbeddingConfig(BaseModel):
+    """Text embeddings for retrieval, from any server with an OpenAI-style /embeddings endpoint.
+
+    That covers OpenAI itself and most local servers (e.g. Ollama's /v1). Code only
+    depends on the Embedder interface in graph/vector.py, so a different provider
+    can replace this without touching retrieval.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    base_url: str = "https://api.openai.com/v1"
+    model: str
+    dimensions: int = Field(ge=1)          # must match the vector index; changing it means re-embedding
+    api_key_env: str | None = "OPENAI_API_KEY"   # None for a local server that needs no key
+    send_dimensions: bool = False          # OpenAI's v3 models can shorten vectors; most servers reject the field
+    batch_size: int = Field(default=64, ge=1)
+    timeout_s: float = Field(default=30.0, gt=0)
+
+    @property
+    def api_key(self) -> SecretStr | None:
+        if self.api_key_env is None:
+            return None
+        value = os.environ.get(self.api_key_env)
+        if value is None:
+            raise RuntimeError(f"Environment variable {self.api_key_env} is not set")
+        return SecretStr(value)
+
+
 class AppConfig(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
@@ -114,6 +142,7 @@ class AppConfig(BaseModel):
     # Optional so that extraction-only setups need no Neo4j section. Code that
     # needs the graph calls graph.driver.get_driver(), which says what is missing.
     neo4j: Neo4jConfig | None = None
+    embedding: EmbeddingConfig | None = None
     # llm: LLMConfig             <- with pipeline/
     # pipeline: PipelineConfig   <- top_k, max_attempts, row_limit
     # graph: GraphConfig         <- max_bridge_tables, weight penalties

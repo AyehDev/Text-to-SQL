@@ -1,77 +1,87 @@
-"""Shared fixtures.
+"""Unit tests for config.py: the two-role connection rules. No database needed."""
 
-Integration tests need a PostgreSQL server you are allowed to create databases
-on. Point SG_TEST_PG_DSN at it, e.g.
+import pytest
+from pydantic import ValidationError
 
-    export SG_TEST_PG_DSN="host=127.0.0.1 port=5432 user=postgres dbname=postgres"
+from schemagraph.config import AppConfig, load_config
 
-Without it, tests marked `integration` are skipped, so plain `pytest` still
-works on a laptop with no database.
+CONFIG_YAML = """
+postgres:
+  host: dbhost
+  port: 5433
+  sslmode: prefer
+  statement_timeout_ms: 7000
+  admin:    {user: sg_admin,    password_env: TEST_ADMIN_PW}
+  readonly: {user: sg_readonly, password_env: TEST_READONLY_PW}
 """
 
-import os
-import uuid
-from pathlib import Path
 
-import psycopg
-import pytest
-from psycopg.conninfo import conninfo_to_dict, make_conninfo
-
-FIXTURES = Path(__file__).parent / "fixtures"
-
-
-def pytest_collection_modifyitems(config, items):
-    no_dsn = pytest.mark.skip(reason="SG_TEST_PG_DSN not set")
-    no_aw = pytest.mark.skip(reason="SG_TEST_ADVENTUREWORKS not set")
-    no_neo = pytest.mark.skip(reason="SG_TEST_NEO4J not set")
-    for item in items:
-        if "integration" in item.keywords and not os.environ.get("SG_TEST_PG_DSN"):
-            item.add_marker(no_dsn)
-        if "adventureworks" in item.keywords and not os.environ.get("SG_TEST_ADVENTUREWORKS"):
-            item.add_marker(no_aw)
-        if "neo4j" in item.keywords and not os.environ.get("SG_TEST_NEO4J"):
-            item.add_marker(no_neo)
+@pytest.fixture
+def cfg(tmp_path, monkeypatch) -> AppConfig:
+    monkeypatch.setenv("TEST_ADMIN_PW", "adminpw")
+    monkeypatch.setenv("TEST_READONLY_PW", "readpw")
+    path = tmp_path / "config.yml"
+    path.write_text(CONFIG_YAML)
+    return load_config(path)
 
 
-@pytest.fixture(scope="session")
-def fixture_dsn(scratch_db_dsn):
-    """The scratch database with tests/fixtures/extraction_fixture.sql loaded once."""
-    with psycopg.connect(scratch_db_dsn, autocommit=True) as c:
-        c.execute((FIXTURES / "extraction_fixture.sql").read_text())
-    return scratch_db_dsn
+def test_readonly_conninfo_sets_timeout_and_read_only(cfg):
+    info = cfg.postgres.conninfo("readonly", "adventureworks")
+    assert "user=sg_readonly" in info
+    assert "dbname=adventureworks" in info
+    assert "statement_timeout=7000" in info
+    assert "default_transaction_read_only=on" in info
 
 
-def _create_scratch_db():
-    """Create a throwaway UTF8 database; return (server DSN, database name, its DSN)."""
-    base = os.environ["SG_TEST_PG_DSN"]
-    name = f"sg_test_{uuid.uuid4().hex[:10]}"
-    with psycopg.connect(base, autocommit=True) as admin:
-        admin.execute(f"CREATE DATABASE \"{name}\" TEMPLATE template0 ENCODING 'UTF8'")
-    return base, name, make_conninfo(base, dbname=name)
+def test_admin_conninfo_has_no_read_only_options(cfg):
+    info = cfg.postgres.conninfo("admin", "adventureworks")
+    assert "user=sg_admin" in info
+    assert "statement_timeout" not in info
+    assert "read_only" not in info
 
 
-def _drop_scratch_db(base, name):
-    with psycopg.connect(base, autocommit=True) as admin:
-        admin.execute(f'DROP DATABASE IF EXISTS "{name}" WITH (FORCE)')
+@pytest.mark.parametrize("role", ["admin", "readonly"])
+def test_client_encoding_is_utf8(cfg, role):
+    # SQL_ASCII databases otherwise return bytes instead of str.
+    assert "client_encoding=utf8" in cfg.postgres.conninfo(role, "x")
 
 
-@pytest.fixture(scope="session")
-def scratch_db_dsn():
-    """Create a throwaway database, yield its DSN, drop it afterwards."""
-    base, name, dsn = _create_scratch_db()
-    try:
-        yield dsn
-    finally:
-        _drop_scratch_db(base, name)
+def test_roles_use_their_own_password(cfg):
+    assert "password=adminpw" in cfg.postgres.conninfo("admin", "x")
+    assert "password=readpw" in cfg.postgres.conninfo("readonly", "x")
 
 
-@pytest.fixture(scope="session")
-def infer_dsn():
-    """A second scratch database holding tests/fixtures/infer_fixture.sql."""
-    base, name, dsn = _create_scratch_db()
-    try:
-        with psycopg.connect(dsn, autocommit=True) as c:
-            c.execute((FIXTURES / "infer_fixture.sql").read_text())
-        yield dsn
-    finally:
-        _drop_scratch_db(base, name)
+@pytest.mark.parametrize("bad", ["", "Adventure", "a b", "a;b", "a-b", "x' OR 1=1", "a/b"])
+def test_invalid_db_id_rejected(cfg, bad):
+    with pytest.raises(ValueError):
+        cfg.postgres.conninfo("readonly", bad)
+
+
+def test_missing_password_env_is_a_clear_error(tmp_path, monkeypatch):
+    monkeypatch.delenv("TEST_ADMIN_PW", raising=False)
+    monkeypatch.setenv("TEST_READONLY_PW", "readpw")
+    path = tmp_path / "config.yml"
+    path.write_text(CONFIG_YAML)
+    cfg = load_config(path)
+    with pytest.raises(RuntimeError, match="TEST_ADMIN_PW"):
+        cfg.postgres.conninfo("admin", "x")
+
+
+def test_password_is_not_printed(cfg):
+    assert "adminpw" not in repr(cfg.postgres.admin.password)
+
+
+def test_unknown_key_rejected(tmp_path):
+    path = tmp_path / "config.yml"
+    path.write_text(CONFIG_YAML + "  surprise: true\n")
+    with pytest.raises(ValidationError):
+        load_config(path)
+
+
+def test_missing_and_empty_files(tmp_path):
+    with pytest.raises(FileNotFoundError):
+        load_config(tmp_path / "nope.yml")
+    empty = tmp_path / "empty.yml"
+    empty.write_text("")
+    with pytest.raises(ValueError, match="empty"):
+        load_config(empty)
