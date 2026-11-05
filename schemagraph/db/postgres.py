@@ -23,6 +23,7 @@ from psycopg.rows import dict_row
 
 from schemagraph.config import DB_ID_RE, get_config
 from schemagraph.models import ExplainResult, QueryResult
+from schemagraph.sql_validation import is_single_select
 
 Role = Literal["admin", "readonly"]
 
@@ -95,10 +96,16 @@ def list_databases() -> list[str]:
 def run_readonly_query(db_id: str, sql: str, row_limit: int) -> QueryResult:
     """Run LLM-generated (or gold) SQL as the read-only role.
 
+    Only one read-only SELECT statement is accepted. Unsafe SQL raises
+    ValueError before opening a database connection.
+
     Raises psycopg.Error on failure; the pipeline turns that into
     status="execution_error". Connection failures raise
     psycopg.OperationalError; the API turns that into HTTP 503.
     """
+    if not is_single_select(sql):
+        raise ValueError("Only a single read-only SELECT statement is allowed.")
+
     with _connect("readonly", db_id) as conn:
         conn.read_only = True
         # Server-side cursor: we pull at most row_limit + 1 rows instead of
@@ -117,9 +124,12 @@ def run_readonly_query(db_id: str, sql: str, row_limit: int) -> QueryResult:
 def explain(db_id: str, sql: str) -> ExplainResult:
     """Ask PostgreSQL to plan the query (EXPLAIN, never ANALYZE) without running it.
 
-    Returns ok=False with the database's error for bad SQL. Connection
-    failures are NOT caught here; they raise.
+    Returns ok=False for unsafe or invalid SQL. Connection failures are NOT
+    caught here; they raise.
     """
+    if not is_single_select(sql):
+        return ExplainResult(ok=False, error="Only a single read-only SELECT statement is allowed.")
+
     with _connect("readonly", db_id) as conn:
         conn.read_only = True
         try:

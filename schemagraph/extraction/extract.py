@@ -30,7 +30,7 @@ from typing import Any, NamedTuple
 import psycopg
 from psycopg import sql as pgsql
 
-from schemagraph.db import postgres as db
+from schemagraph import db
 from schemagraph.models import (
     ColumnMeta,
     DatabaseMetadata,

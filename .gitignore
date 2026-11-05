@@ -4,3 +4,4 @@ mini_dev/
 adventureworks-for-postgres/
 pytest_cache/
 __pycache__/
+.vscode/
