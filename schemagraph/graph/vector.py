@@ -132,8 +132,9 @@ def column_text(table: TableMeta, column: ColumnMeta, include_generated: bool = 
 class _HttpEmbedder:
     """Batching, retries and checks shared by the HTTP embedders.
 
-    A provider supplies two things: how to build the request body (`_payload`) and the
-    path under base_url. Both providers answer with {"data": [{"index", "embedding"}, ...]}.
+    A provider supplies the request body (`_payload`) and, if it differs from the OpenAI
+    style, where to post (`_url`), how to authenticate (`_auth_headers`) and how to read the
+    answer (`_read_vectors`). OpenAI and Voyage answer with {"data": [{"index", "embedding"}, ...]}.
     """
 
     RETRY_STATUS = {429, 500, 502, 503, 504}
@@ -167,21 +168,30 @@ class _HttpEmbedder:
     def _payload(self, texts: list[str], kind: str) -> dict[str, Any]:
         raise NotImplementedError
 
+    def _url(self) -> str:
+        return self.config.base_url.rstrip("/") + self.PATH
+
+    def _auth_headers(self, key: str) -> dict[str, str]:
+        return {"Authorization": f"Bearer {key}"}
+
+    def _read_vectors(self, body: Any) -> list[list[float]]:
+        data = sorted(body["data"], key=lambda item: item["index"])
+        return [[float(x) for x in item["embedding"]] for item in data]
+
     def _embed_batch(self, texts: list[str], kind: str) -> list[list[float]]:
         headers = {"Content-Type": "application/json"}
         key = self.config.api_key
         if key is not None:
-            headers["Authorization"] = f"Bearer {key.get_secret_value()}"
+            headers.update(self._auth_headers(key.get_secret_value()))
         request = urllib.request.Request(
-            self.config.base_url.rstrip("/") + self.PATH,
+            self._url(),
             data=json.dumps(self._payload(texts, kind)).encode(),
             headers=headers,
             method="POST",
         )
         body = self._send(request)
         try:
-            data = sorted(body["data"], key=lambda item: item["index"])
-            vectors = [[float(x) for x in item["embedding"]] for item in data]
+            vectors = self._read_vectors(body)
         except (KeyError, TypeError, ValueError) as exc:
             raise EmbeddingError(f"unexpected response from the embedding service: {str(body)[:200]}") from exc
         if len(vectors) != len(texts):
@@ -238,7 +248,50 @@ class VoyageEmbedder(_HttpEmbedder):
         return payload
 
 
-EMBEDDERS: dict[str, type[_HttpEmbedder]] = {"openai": OpenAICompatibleEmbedder, "voyage": VoyageEmbedder}
+class GeminiEmbedder(_HttpEmbedder):
+    """Google's Gemini API: POST {base_url}/models/{model}:batchEmbedContents.
+
+    Two generations differ in how a query is told apart from a document:
+    `gemini-embedding-001` takes a `taskType` (RETRIEVAL_QUERY / RETRIEVAL_DOCUMENT);
+    `gemini-embedding-2` rejects `taskType` and expects a text prefix instead
+    ("task: search result | query: ..." and "title: none | text: ..."). Any model name that does
+    not start with `gemini-embedding-2` is treated like 001. Shortened vectors are requested with
+    `outputDimensionality`; without it the model returns 3072. 001 does not renormalise shortened
+    vectors, which is harmless here because the Neo4j indexes use cosine similarity.
+    The key goes in the `x-goog-api-key` header, never in the URL.
+    """
+
+    def _prefix_mode(self) -> bool:
+        return self.config.model.startswith("gemini-embedding-2")
+
+    def _url(self) -> str:
+        return f"{self.config.base_url.rstrip('/')}/models/{self.config.model}:batchEmbedContents"
+
+    def _auth_headers(self, key: str) -> dict[str, str]:
+        return {"x-goog-api-key": key}
+
+    def _payload(self, texts: list[str], kind: str) -> dict[str, Any]:
+        requests = []
+        for text in texts:
+            if self._prefix_mode():
+                text = f"task: search result | query: {text}" if kind == "query" else f"title: none | text: {text}"
+            request: dict[str, Any] = {"model": f"models/{self.config.model}", "content": {"parts": [{"text": text}]}}
+            if not self._prefix_mode():
+                request["taskType"] = "RETRIEVAL_QUERY" if kind == "query" else "RETRIEVAL_DOCUMENT"
+            if self.config.send_dimensions:
+                request["outputDimensionality"] = self.config.dimensions
+            requests.append(request)
+        return {"requests": requests}
+
+    def _read_vectors(self, body: Any) -> list[list[float]]:
+        return [[float(x) for x in item["values"]] for item in body["embeddings"]]
+
+
+EMBEDDERS: dict[str, type[_HttpEmbedder]] = {
+    "openai": OpenAICompatibleEmbedder,
+    "voyage": VoyageEmbedder,
+    "gemini": GeminiEmbedder,
+}
 
 
 def make_embedder(config: EmbeddingConfig, **kwargs: Any) -> Embedder:

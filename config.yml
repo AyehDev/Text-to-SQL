@@ -39,6 +39,14 @@ embedding:
 #   # api_key_env: VOYAGE_API_KEY    # the default for voyage
 #   # base_url: https://ai.mongodb.com/v1   # Voyage's current endpoint; keys issued by voyageai.com may need https://api.voyageai.com/v1
 #
+# Google Gemini (key in GEMINI_API_KEY):
+# embedding:
+#   provider: gemini
+#   model: gemini-embedding-2        # or gemini-embedding-001
+#   dimensions: 1536                 # default is 3072; Google recommends 768, 1536 or 3072
+#   send_dimensions: true            # needed for anything other than 3072
+#   name: gemini
+#
 # To keep two models in one graph (for example to compare them), give each its own `name`
 # and switch between configs with SCHEMAGRAPH_CONFIG. Vectors and indexes are stored per name.
 #   name: voyage

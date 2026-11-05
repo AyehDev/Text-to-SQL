@@ -278,3 +278,117 @@ def test_explicit_name_overrides_the_embedders(meta, monkeypatch):
     enrich.embed_nodes(DB, emb, store, name="trial")
     assert "embedding_trial" in next(iter(store.tables.values()))
     assert retrieve.retrieve_seed_tables(DB, "customer", 3, embedder=emb, session=store, name="trial")
+
+
+# ----------------------------------------------------------------- Gemini
+
+
+def test_gemini_defaults():
+    c = make_cfg(provider="gemini", model="gemini-embedding-2")
+    assert c.provider == "gemini" and c.api_key_env == "GEMINI_API_KEY"
+    assert c.base_url == "https://generativelanguage.googleapis.com/v1beta"
+
+
+class GeminiHandler(BaseHTTPRequestHandler):
+    seen: list = []
+    status_codes: list = []        # popped one per request; empty means 200
+
+    def do_POST(self):
+        body = json.loads(self.rfile.read(int(self.headers["Content-Length"])))
+        GeminiHandler.seen.append((self.path, {k.lower(): v for k, v in self.headers.items()}, body))
+        if GeminiHandler.status_codes and (code := GeminiHandler.status_codes.pop(0)) != 200:
+            self.send_response(code)
+            self.send_header("Content-Length", "0")
+            self.end_headers()
+            return
+        dims = body["requests"][0].get("outputDimensionality", 3)
+        raw = json.dumps({"embeddings": [{"values": [0.25] * dims} for _ in body["requests"]]}).encode()
+        self.send_response(200)
+        self.send_header("Content-Length", str(len(raw)))
+        self.end_headers()
+        self.wfile.write(raw)
+
+    def log_message(self, *a):
+        pass
+
+
+@pytest.fixture()
+def gemini_server():
+    GeminiHandler.seen, GeminiHandler.status_codes = [], []
+    srv = HTTPServer(("127.0.0.1", 0), GeminiHandler)
+    threading.Thread(target=srv.serve_forever, daemon=True).start()
+    yield f"http://127.0.0.1:{srv.server_port}/v1beta"
+    srv.shutdown()
+
+
+def gemini(server, monkeypatch, **kw):
+    monkeypatch.setenv("GEMINI_API_KEY", "gk")
+    kw.setdefault("model", "gemini-embedding-001")
+    kw.setdefault("dimensions", 3)
+    return vector.make_embedder(make_cfg(provider="gemini", base_url=server, **kw), sleep=lambda s: None)
+
+
+def test_gemini_001_uses_task_types_and_the_key_header(gemini_server, monkeypatch):
+    emb = gemini(gemini_server, monkeypatch)
+    assert isinstance(emb, vector.GeminiEmbedder)
+    assert emb.embed_documents(["a", "b"]) == [[0.25] * 3, [0.25] * 3]
+    emb.embed_query("q")
+    (path, headers, doc_body), (_, _, query_body) = GeminiHandler.seen
+    assert path == "/v1beta/models/gemini-embedding-001:batchEmbedContents"
+    assert headers["x-goog-api-key"] == "gk" and "authorization" not in headers
+    assert doc_body["requests"] == [
+        {"model": "models/gemini-embedding-001", "content": {"parts": [{"text": t}]}, "taskType": "RETRIEVAL_DOCUMENT"}
+        for t in ("a", "b")
+    ]
+    assert query_body["requests"][0]["taskType"] == "RETRIEVAL_QUERY"
+    assert "outputDimensionality" not in doc_body["requests"][0]
+
+
+def test_gemini_2_uses_text_prefixes_and_no_task_type(gemini_server, monkeypatch):
+    emb = gemini(gemini_server, monkeypatch, model="gemini-embedding-2")
+    emb.embed_documents(["orders table"])
+    emb.embed_query("how many orders")
+    (path, _, doc_body), (_, _, query_body) = GeminiHandler.seen
+    assert path == "/v1beta/models/gemini-embedding-2:batchEmbedContents"
+    doc, query = doc_body["requests"][0], query_body["requests"][0]
+    assert doc["content"]["parts"][0]["text"] == "title: none | text: orders table"
+    assert query["content"]["parts"][0]["text"] == "task: search result | query: how many orders"
+    assert "taskType" not in doc and "taskType" not in query
+
+
+def test_gemini_asks_for_shortened_vectors_only_when_told_to(gemini_server, monkeypatch):
+    emb = gemini(gemini_server, monkeypatch, dimensions=5, send_dimensions=True)
+    assert len(emb.embed_query("q")) == 5
+    assert GeminiHandler.seen[0][2]["requests"][0]["outputDimensionality"] == 5
+
+
+def test_gemini_batches_by_batch_size_and_keeps_order(gemini_server, monkeypatch):
+    emb = gemini(gemini_server, monkeypatch, batch_size=2)
+    assert len(emb.embed_documents(list("abcde"))) == 5
+    assert [len(body["requests"]) for _, _, body in GeminiHandler.seen] == [2, 2, 1]
+
+
+def test_gemini_retries_rate_limits_then_succeeds(gemini_server, monkeypatch):
+    GeminiHandler.status_codes = [429, 503]
+    emb = gemini(gemini_server, monkeypatch)
+    assert emb.embed_query("q") == [0.25] * 3
+    assert len(GeminiHandler.seen) == 3
+
+
+def test_gemini_dimension_mismatch_and_bad_shape_are_clear_errors(gemini_server, monkeypatch):
+    emb = gemini(gemini_server, monkeypatch, dimensions=9)          # server returns 3 without send_dimensions
+    with pytest.raises(vector.EmbeddingError, match="send_dimensions"):
+        emb.embed_query("q")
+
+    class Odd(vector.GeminiEmbedder):
+        def _send(self, request):
+            return {"data": []}
+
+    odd = Odd(make_cfg(provider="gemini", model="gemini-embedding-001", api_key_env=None))
+    with pytest.raises(vector.EmbeddingError, match="unexpected response"):
+        odd.embed_query("q")
+
+
+def test_gemini_key_is_not_in_the_url(gemini_server, monkeypatch):
+    gemini(gemini_server, monkeypatch).embed_query("q")
+    assert "gk" not in GeminiHandler.seen[0][0] and "key=" not in GeminiHandler.seen[0][0]

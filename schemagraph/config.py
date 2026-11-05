@@ -111,6 +111,7 @@ EMBEDDING_PROVIDERS = {
     # provider: (default base_url, default api key variable)
     "openai": ("https://api.openai.com/v1", "OPENAI_API_KEY"),
     "voyage": ("https://ai.mongodb.com/v1", "VOYAGE_API_KEY"),
+    "gemini": ("https://generativelanguage.googleapis.com/v1beta", "GEMINI_API_KEY"),
 }
 PROFILE_NAME_RE = re.compile(r"^[a-z][a-z0-9_]{0,30}$")
 
@@ -122,7 +123,7 @@ class EmbeddingConfig(BaseModel):
         `openai`: OpenAI, or any server with an OpenAI-style /embeddings endpoint
         (Ollama's /v1, vLLM, ...). `voyage`: Voyage AI. Anthropic has no embedding model
         of its own and recommends Voyage, so `anthropic` is accepted as another name
-        for `voyage`.
+        for `voyage`. `gemini`: Google's Gemini API (`gemini-embedding-2`, `gemini-embedding-001`).
     name
         Names this set of vectors in Neo4j. The default keeps the plain index and property
         names; any other name adds a suffix, so vectors from different models can sit
@@ -134,7 +135,7 @@ class EmbeddingConfig(BaseModel):
 
     model_config = ConfigDict(extra="forbid")
 
-    provider: Literal["openai", "voyage", "anthropic"] = "openai"
+    provider: Literal["openai", "voyage", "gemini", "anthropic"] = "openai"
     name: str = "default"
     base_url: str | None = None            # default: the provider's public endpoint
     model: str

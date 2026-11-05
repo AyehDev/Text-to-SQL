@@ -348,6 +348,7 @@ Set the model in the `embedding:` section of `config.yml` (commented examples ar
 | --- | --- | --- | --- |
 | `openai` | `text-embedding-3-large`, `-3-small`, or any OpenAI-style server (Ollama, vLLM) | `OPENAI_API_KEY` | `send_dimensions: true` makes OpenAI return shortened vectors. Use `api_key_env: null` for a local server |
 | `voyage` (or `anthropic`) | `voyage-4`, `voyage-4-large`, `voyage-4-lite`, `voyage-code-4` | `VOYAGE_API_KEY` | Anthropic has no embedding model of its own and recommends Voyage AI, so `anthropic` is another name for `voyage`. Voyage embeds queries and documents differently; the code sets that for you |
+| `gemini` | `gemini-embedding-2` (current, multimodal, stable), `gemini-embedding-001` (text only) | `GEMINI_API_KEY` | Default size is 3072; `send_dimensions: true` asks for fewer (Google recommends 768, 1536 or 3072). The two models tell queries from documents differently (`-001` a `taskType`, `-2` a text prefix) and the code does it for you. Their vectors are not compatible, so changing one for the other means re-embedding. The request shape follows Google's REST docs and has not yet been run against the live API |
 
 - **`dimensions` must match the model.** The code checks every response and says so if it does not. The vector index has the
   same dimension (Neo4j allows 1 to 4096; above 2048 needs Neo4j 5.18 or later).
