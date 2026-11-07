@@ -13,15 +13,13 @@ from schemagraph.models import (
 from schemagraph.pipeline.llm import chat_completion
 
 
-def build_explanation(
-    question: str,
-    sql: str,
-    context: SchemaContext,
-    seeds: list[SeedTable],
-    *,
-    usage: dict[str, int] | None = None,
-) -> Explanation:
-    """Create explanation fields from the plan and an LLM-written summary."""
+def explain_context(context: SchemaContext, seeds: list[SeedTable]) -> Explanation:
+    """The explanation's structure, with no model call: which tables were given and why, the joins, warnings.
+
+    `summary` is left empty; `build_explanation` fills it. This part is cheap, so the pipeline attaches it
+    to every answer that had a schema context (success or not), and the evaluation harness, which never asks
+    for the summary, reads the tables the model was given from it.
+    """
     plan = context.join_plan
     seed_by_uid = {seed.uid: seed for seed in seeds}
     bridge_uids = set(plan.bridge_tables) if plan is not None else set()
@@ -60,6 +58,30 @@ def build_explanation(
                 )
             )
 
+    alternatives = plan.alternatives if plan is not None else []
+    interpretation = (
+        "The join planner found alternative table paths; the SQL chooses one of them."
+        if alternatives
+        else None
+    )
+    return Explanation(
+        summary="",
+        tables=tables,
+        join_path=joins,
+        interpretation=interpretation,
+        warnings=list(context.notes),
+    )
+
+
+def build_explanation(
+    question: str,
+    sql: str,
+    context: SchemaContext,
+    seeds: list[SeedTable],
+    *,
+    usage: dict[str, int] | None = None,
+) -> Explanation:
+    """`explain_context` plus a one-sentence summary written by the model."""
     messages = [
         {
             "role": "system",
@@ -75,16 +97,4 @@ def build_explanation(
         usage["input_tokens"] = input_tokens
         usage["output_tokens"] = output_tokens
 
-    alternatives = plan.alternatives if plan is not None else []
-    interpretation = (
-        "The join planner found alternative table paths; the SQL chooses one of them."
-        if alternatives
-        else None
-    )
-    return Explanation(
-        summary=summary,
-        tables=tables,
-        join_path=joins,
-        interpretation=interpretation,
-        warnings=list(context.notes),
-    )
+    return explain_context(context, seeds).model_copy(update={"summary": summary})

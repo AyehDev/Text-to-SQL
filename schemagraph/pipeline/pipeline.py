@@ -18,7 +18,7 @@ from schemagraph.models import (
 )
 from schemagraph.pipeline.context import build_context
 from schemagraph.pipeline.examples import retrieve_examples
-from schemagraph.pipeline.explain import build_explanation
+from schemagraph.pipeline.explain import build_explanation, explain_context
 from schemagraph.pipeline.generate import generate_sql
 from schemagraph.pipeline.validate import validate
 from schemagraph.sql_validation import check_select
@@ -122,7 +122,10 @@ def answer_question(
             attempts.append(Attempt(sql=sql))
             break
 
-    explanation = None
+    # The structural explanation (tables given, joins, warnings) needs no model call, so it is attached
+    # whenever there was a schema context, whatever the status, and whether or not `explain` is set.
+    # `explain` only controls the model-written summary, which needs a successful query.
+    explanation = explain_context(context, seeds) if context.tables else None
     explanation_ms = 0
     if explain and status == "success" and final_sql is not None:
         explanation_started = time.perf_counter()

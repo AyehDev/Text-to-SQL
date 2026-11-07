@@ -72,7 +72,9 @@ def test_answer_question_success_skips_explanation_when_requested(
 
     assert response.status == "success"
     assert response.result.rows == [["2"]]
-    assert response.explanation is None
+    # No summary was asked for (and no model call made), but the tables the model was given are reported.
+    assert response.explanation is not None and response.explanation.summary == ""
+    assert [t.uid for t in response.explanation.tables] == ["schools:public.school"]
     assert response.metrics.input_tokens == 8
     assert response.metrics.attempt_count == 1
     assert contexts[0][1]["planner_options"] == {"weighted": False}
