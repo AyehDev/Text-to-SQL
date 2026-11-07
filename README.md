@@ -186,10 +186,23 @@ python scripts/build_graph.py --db adventureworks --skip-extraction   # reuse da
 Before touching any database it checks that Neo4j answers and, unless `--skip-enrichment`, that the configured embedding
 model is reachable and returns vectors of the size `config.yml` says (a wrong size would leave the index silently empty).
 Those failures exit 2 with nothing changed. After that, one database failing does not stop the others; the exit code is 1 if
-any failed or the graph does not match its metadata. `--rebuild` clears each db_id's nodes first, which also removes
-its embeddings, so use it with enrichment on. If you change a model's `dimensions`, call
-`vector.drop_vector_indexes(name=...)` first, because an existing index keeps its old size. LLM-written descriptions are
-not a step yet.
+any failed or the graph does not match its metadata, and 3 if embedding was cut short by rate limiting (below).
+`--rebuild` clears each db_id's nodes first, which also removes its embeddings, so use it with enrichment on.
+If you change a model's `dimensions`, call `vector.drop_vector_indexes(name=...)` first, because an existing index keeps
+its old size. LLM-written descriptions are not a step yet.
+
+**Rate limits and resuming (free-tier API keys).** Embeddings are saved as they are made: tables first, then columns, one
+request's worth of texts at a time. A rate-limited request (HTTP 429) waits as long as the service asks (`Retry-After`, or
+Google's `retryDelay`), at least 5, 15, 30, then 60 seconds, until `max_wait_s` (default 120) is used up. Then embedding stops
+cleanly: the run prints `PART ... embedded 7/7 tables and 40/93 columns`, keeps everything saved, and exits 3. Rerun the same
+command **without `--rebuild`** (it would clear the vectors) and only what is missing is embedded; add `--skip-extraction` to
+reuse the metadata file. Every stored vector carries a fingerprint of its text and model, so a rerun also re-embeds nodes whose
+description changed, or whose model, provider or dimensions changed under the same `name`. `--reembed` redoes everything.
+Vectors written before fingerprints existed are replaced once. In `config.yml` under `embedding:`:
+`max_wait_s` (a longer budget rides out per-minute limits; a daily quota will not clear in any budget, so the run stops) and
+`requests_per_minute` (spaces requests out so the limit is not hit). Gemini sends 100 texts per request unless `batch_size` says
+otherwise, which matters on tiers limited by requests per minute. Retrieval skips nodes without a vector, so do not rely on a
+partial graph for answers; the coverage numbers in the summary say how far it got.
 
 ## API reference
 

@@ -46,6 +46,30 @@ class EmbeddingError(RuntimeError):
     """The embedding service failed or returned something unusable."""
 
 
+class RateLimited(EmbeddingError):
+    """The service kept answering HTTP 429 until the wait budget (`max_wait_s`) ran out."""
+
+    def __init__(self, message: str, retry_after: float | None = None) -> None:
+        super().__init__(message)
+        self.retry_after = retry_after
+
+
+RATE_LIMIT_BACKOFF = (5.0, 15.0, 30.0, 60.0)  # seconds; the last value repeats
+_RETRY_DELAY_RE = re.compile(r'"retryDelay"\s*:\s*"(\d+(?:\.\d+)?)s"')
+
+
+def retry_after_seconds(header: str | None, body: str = "") -> float | None:
+    """How long the service asked us to wait: the Retry-After header (seconds), else the
+    `retryDelay` Google puts in the body of its 429 answers. None if neither is there."""
+    if header:
+        try:
+            return max(0.0, float(header))
+        except ValueError:
+            pass  # an HTTP date: not worth parsing, the backoff schedule covers it
+    match = _RETRY_DELAY_RE.search(body)
+    return float(match.group(1)) if match else None
+
+
 class Embedder(Protocol):
     def embed_query(self, text: str) -> list[float]: ...
 
@@ -146,11 +170,14 @@ class _HttpEmbedder:
         *,
         sleep: Callable[[float], None] = time.sleep,
         retries: int = 3,
+        clock: Callable[[], float] = time.monotonic,
     ) -> None:
         self.config = config
         self.name = config.name
         self._sleep = sleep
         self._retries = retries
+        self._clock = clock
+        self._next_request_at: float | None = None
 
     def embed_query(self, text: str) -> list[float]:
         return self._embed([text], "query")[0]
@@ -205,23 +232,56 @@ class _HttpEmbedder:
                 )
         return vectors
 
+    def _pace(self) -> None:
+        """Space requests out when `requests_per_minute` is set."""
+        rpm = self.config.requests_per_minute
+        if not rpm:
+            return
+        now = self._clock()
+        start = now if self._next_request_at is None else max(now, self._next_request_at)
+        if start > now:
+            self._sleep(start - now)
+        self._next_request_at = start + 60.0 / rpm
+
     def _send(self, request: urllib.request.Request) -> Any:
-        for attempt in range(self._retries + 1):
+        """POST with retries. Rate limits (429) wait as long as the service asks, at least the
+        backoff schedule, until `max_wait_s` is spent; other transient errors retry a few times."""
+        waited = 0.0
+        rate_limited = 0
+        attempt = 0
+        while True:
+            self._pace()
             try:
                 with urllib.request.urlopen(request, timeout=self.config.timeout_s) as response:
                     return json.loads(response.read())
             except urllib.error.HTTPError as exc:
-                detail = exc.read()[:200].decode(errors="replace")
+                raw = exc.read()[:2000].decode(errors="replace")
+                detail = raw[:200]
+                if exc.code == 429:
+                    hinted = retry_after_seconds(exc.headers.get("Retry-After") if exc.headers else None, raw)
+                    wait = max(hinted or 0.0, RATE_LIMIT_BACKOFF[min(rate_limited, len(RATE_LIMIT_BACKOFF) - 1)])
+                    if waited + wait > self.config.max_wait_s:
+                        raise RateLimited(
+                            f"rate limited (HTTP 429) and the {self.config.max_wait_s:g}s wait budget (max_wait_s) "
+                            f"is used up after {waited:g}s: {detail}",
+                            hinted,
+                        ) from exc
+                    log.warning("rate limited by the embedding service; waiting %gs", wait)
+                    self._sleep(wait)
+                    waited += wait
+                    rate_limited += 1
+                    continue
                 if exc.code in self.RETRY_STATUS and attempt < self._retries:
                     self._sleep(2**attempt)
+                    attempt += 1
                     continue
                 raise EmbeddingError(f"embedding service returned HTTP {exc.code}: {detail}") from exc
             except (urllib.error.URLError, TimeoutError) as exc:
                 if attempt < self._retries:
                     self._sleep(2**attempt)
+                    attempt += 1
                     continue
                 raise EmbeddingError(f"cannot reach the embedding service at {self.config.base_url}: {exc}") from exc
-        raise AssertionError("unreachable")  # pragma: no cover
 
 
 class OpenAICompatibleEmbedder(_HttpEmbedder):

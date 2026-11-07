@@ -291,16 +291,22 @@ def test_gemini_defaults():
 
 class GeminiHandler(BaseHTTPRequestHandler):
     seen: list = []
-    status_codes: list = []        # popped one per request; empty means 200
+    status_codes: list = []        # popped one per request: a status or (status, headers, body); empty means 200
 
     def do_POST(self):
         body = json.loads(self.rfile.read(int(self.headers["Content-Length"])))
         GeminiHandler.seen.append((self.path, {k.lower(): v for k, v in self.headers.items()}, body))
-        if GeminiHandler.status_codes and (code := GeminiHandler.status_codes.pop(0)) != 200:
-            self.send_response(code)
-            self.send_header("Content-Length", "0")
-            self.end_headers()
-            return
+        if GeminiHandler.status_codes:
+            step = GeminiHandler.status_codes.pop(0)          # a status, or (status, headers, body text)
+            code, extra, text = (step, {}, "") if isinstance(step, int) else step
+            if code != 200:
+                self.send_response(code)
+                for key, value in extra.items():
+                    self.send_header(key, value)
+                self.send_header("Content-Length", str(len(text.encode())))
+                self.end_headers()
+                self.wfile.write(text.encode())
+                return
         dims = body["requests"][0].get("outputDimensionality", 3)
         raw = json.dumps({"embeddings": [{"values": [0.25] * dims} for _ in body["requests"]]}).encode()
         self.send_response(200)
@@ -392,3 +398,99 @@ def test_gemini_dimension_mismatch_and_bad_shape_are_clear_errors(gemini_server,
 def test_gemini_key_is_not_in_the_url(gemini_server, monkeypatch):
     gemini(gemini_server, monkeypatch).embed_query("q")
     assert "gk" not in GeminiHandler.seen[0][0] and "key=" not in GeminiHandler.seen[0][0]
+
+
+# ----------------------------------------------------------------- rate limits
+
+
+def limited(server, monkeypatch, **kw):
+    """A Gemini embedder that records its sleeps instead of sleeping."""
+    monkeypatch.setenv("GEMINI_API_KEY", "gk")
+    sleeps = []
+    cfg = make_cfg(provider="gemini", base_url=server, model="gemini-embedding-001", dimensions=3, **kw)
+    return vector.make_embedder(cfg, sleep=sleeps.append), sleeps
+
+
+def test_retry_after_header_and_google_retry_delay_are_understood():
+    assert vector.retry_after_seconds("40") == 40.0
+    assert vector.retry_after_seconds("Wed, 21 Oct 2026 07:28:00 GMT") is None
+    body = '{"error": {"details": [{"@type": "type.googleapis.com/google.rpc.RetryInfo", "retryDelay": "34s"}]}}'
+    assert vector.retry_after_seconds(None, body) == 34.0
+    assert vector.retry_after_seconds("7", body) == 7.0                      # the header wins
+    assert vector.retry_after_seconds(None, "") is None
+
+
+def test_a_rate_limit_waits_as_long_as_the_service_asks(gemini_server, monkeypatch):
+    GeminiHandler.status_codes = [(429, {"Retry-After": "40"}, "")]
+    emb, sleeps = limited(gemini_server, monkeypatch)
+    assert emb.embed_query("q") == [0.25] * 3
+    assert sleeps == [40.0]
+
+
+def test_a_rate_limit_without_a_hint_follows_the_backoff_schedule(gemini_server, monkeypatch):
+    GeminiHandler.status_codes = [429, 429, 429]
+    emb, sleeps = limited(gemini_server, monkeypatch)
+    assert emb.embed_query("q") == [0.25] * 3
+    assert sleeps == [5.0, 15.0, 30.0]
+
+
+def test_the_wait_budget_ends_in_rate_limited(gemini_server, monkeypatch):
+    GeminiHandler.status_codes = [429] * 10
+    emb, sleeps = limited(gemini_server, monkeypatch, max_wait_s=20)
+    with pytest.raises(vector.RateLimited, match="wait budget.*max_wait_s") as caught:
+        emb.embed_query("q")
+    assert isinstance(caught.value, vector.EmbeddingError)
+    assert sleeps == [5.0, 15.0] and len(GeminiHandler.seen) == 3         # 5 + 15 = 20, the next 30 would exceed it
+
+
+def test_zero_budget_gives_up_at_once(gemini_server, monkeypatch):
+    GeminiHandler.status_codes = [429] * 3
+    emb, sleeps = limited(gemini_server, monkeypatch, max_wait_s=0)
+    with pytest.raises(vector.RateLimited):
+        emb.embed_query("q")
+    assert sleeps == [] and len(GeminiHandler.seen) == 1
+
+
+def test_a_long_hint_beyond_the_budget_does_not_wait_at_all(gemini_server, monkeypatch):
+    GeminiHandler.status_codes = [(429, {"Retry-After": "3600"}, "")]      # e.g. a daily quota
+    emb, sleeps = limited(gemini_server, monkeypatch, max_wait_s=120)
+    with pytest.raises(vector.RateLimited) as caught:
+        emb.embed_query("q")
+    assert sleeps == [] and caught.value.retry_after == 3600.0
+
+
+def test_each_request_gets_a_fresh_budget(gemini_server, monkeypatch):
+    GeminiHandler.status_codes = [429, 200, 429]
+    emb, sleeps = limited(gemini_server, monkeypatch, max_wait_s=5, batch_size=1)
+    assert len(emb.embed_documents(["a", "b"])) == 2
+    assert sleeps == [5.0, 5.0]
+
+
+def test_requests_per_minute_spaces_requests_out(gemini_server, monkeypatch):
+    monkeypatch.setenv("GEMINI_API_KEY", "gk")
+    now = [100.0]
+    sleeps = []
+
+    def sleep(seconds):
+        sleeps.append(seconds)
+        now[0] += seconds
+
+    cfg = make_cfg(provider="gemini", base_url=gemini_server, model="gemini-embedding-001", dimensions=3,
+                   requests_per_minute=30, batch_size=1)
+    emb = vector.make_embedder(cfg, sleep=sleep, clock=lambda: now[0])
+    emb.embed_documents(["a", "b", "c"])
+    assert sleeps == [2.0, 2.0]                                            # 30 per minute: one every 2 seconds
+    now[0] += 10                                                           # a long pause: no catch-up burst, no wait
+    emb.embed_query("d")
+    assert sleeps == [2.0, 2.0]
+
+
+def test_rate_limit_settings_and_gemini_batch_default():
+    c = make_cfg(provider="gemini")
+    assert (c.batch_size, c.max_wait_s, c.requests_per_minute) == (100, 120.0, None)
+    assert make_cfg(provider="gemini", batch_size=10).batch_size == 10
+    assert make_cfg().batch_size == 64 and make_cfg(provider="voyage").batch_size == 64
+    with pytest.raises(ValidationError):
+        make_cfg(requests_per_minute=0)
+    with pytest.raises(ValidationError):
+        make_cfg(max_wait_s=-1)

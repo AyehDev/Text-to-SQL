@@ -129,6 +129,12 @@ class EmbeddingConfig(BaseModel):
         names; any other name adds a suffix, so vectors from different models can sit
         side by side in one graph and be compared (see graph/vector.py).
 
+    max_wait_s / requests_per_minute
+        Rate limits (HTTP 429, common on free tiers): a limited request waits and retries
+        (honouring Retry-After) for at most `max_wait_s` seconds in total, then gives up with
+        a "rate limited" result and the embeddings stored so far are kept. `requests_per_minute`
+        spaces requests out so the limit is not hit in the first place.
+
     Defaults for base_url and api_key_env depend on the provider. Set `api_key_env: null`
     for a local server that needs no key.
     """
@@ -142,8 +148,10 @@ class EmbeddingConfig(BaseModel):
     dimensions: int = Field(ge=1)          # must match the vector index; changing it means re-embedding
     api_key_env: str | None = None         # default: OPENAI_API_KEY / VOYAGE_API_KEY; null means no key
     send_dimensions: bool = False          # ask the API for shortened vectors (OpenAI v3, Voyage 4 support it)
-    batch_size: int = Field(default=64, ge=1)
+    batch_size: int = Field(default=64, ge=1)   # texts per request (gemini: 100 unless set)
     timeout_s: float = Field(default=30.0, gt=0)
+    max_wait_s: float = Field(default=120.0, ge=0)             # longest total wait on one rate-limited request
+    requests_per_minute: int | None = Field(default=None, ge=1)  # pace calls to stay under a free-tier limit
 
     @field_validator("name")
     @classmethod
@@ -157,6 +165,8 @@ class EmbeddingConfig(BaseModel):
         if self.provider == "anthropic":
             self.provider = "voyage"
         base_url, key_env = EMBEDDING_PROVIDERS[self.provider]
+        if self.provider == "gemini" and "batch_size" not in self.model_fields_set:
+            self.batch_size = 100  # Gemini accepts up to 100 texts per batchEmbedContents call
         if self.base_url is None:
             self.base_url = base_url
         if "api_key_env" not in self.model_fields_set:  # an explicit null stays null
