@@ -193,8 +193,15 @@ class LLMConfig(BaseModel):
     model: str
     api_key_env: str | None = "OPENAI_API_KEY"
     timeout_s: float = Field(default=60.0, gt=0)
-    temperature: float = Field(default=0.0, ge=0.0, le=2.0)
+    temperature: float | None = Field(default=0.0, ge=0.0, le=2.0)  # null: leave it out (reasoning models reject it)
     max_tokens: int = Field(default=2048, ge=1)
+    # Newer OpenAI models reject "max_tokens" and want "max_completion_tokens".
+    max_tokens_param: Literal["max_tokens", "max_completion_tokens"] = "max_tokens"
+    # Transient failures (HTTP 429/5xx, timeouts, connection errors) are retried this many times,
+    # waiting what the service asks for (Retry-After) or 2, 4, 8 ... seconds, never more than max_wait_s
+    # for one wait; a longer demand fails at once with the service's message.
+    max_retries: int = Field(default=3, ge=0)
+    max_wait_s: float = Field(default=30.0, gt=0)
 
     @cached_property
     def api_key(self) -> SecretStr | None:

@@ -66,12 +66,17 @@ llm:
   timeout_s: 60
   temperature: 0
   max_tokens: 4096                 # Gemini 2.5 models count their hidden "thinking" tokens against this
+  max_retries: 3                   # HTTP 429/5xx, timeouts and dropped connections are retried (2, 4, 8 s, or Retry-After)
+  max_wait_s: 30                   # longest single wait; a service asking for more fails at once with its message
 #
 # OpenAI:
 # llm:
 #   provider: openai_compatible
 #   base_url: https://api.openai.com/v1
-#   model: gpt-4o-mini             # newer reasoning models reject max_tokens/temperature (HTTP 400)
+#   model: gpt-4o-mini
+#   # For reasoning models (o-series, gpt-5): they reject max_tokens and temperature (HTTP 400), so
+#   #   temperature: null                          leave temperature out of the request
+#   #   max_tokens_param: max_completion_tokens    send the limit under the name they accept
 #   api_key_env: OPENAI_API_KEY
 #
 # A local server (Ollama, vLLM, LM Studio), no key:
