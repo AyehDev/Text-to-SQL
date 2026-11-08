@@ -13,10 +13,13 @@ reads Neo4j. For every question with gold SQL it asks three things.
 2. Score spread. Cosine scores from many embedding models are bunched together (0.81 to 0.87 is common), so a
    fixed top_k admits noise that scores almost the same as the right tables. The table of mean scores at
    ranks 1, 5 and 20 shows how much room there is to tell them apart.
-3. Seed pruning. The seeds go to the join planner, which adds bridge tables to connect them, so every noise
-   seed can bloat the context. For each strategy (keep at most `top_k` seeds, and only those within `gap` of
-   the best score) it reports seed recall, graph recall (the planner's tables, as the model would see them),
-   and the average number of tables in the context. A good strategy keeps recall and shrinks the context.
+3. Seed strategies. The seeds go to the join planner, which adds bridge tables to connect them. Each strategy
+   keeps at most `top_k` seeds and optionally adds the tables the seeds have foreign keys to ("expand N,
+   H-hop": up to N tables within H links, see `retrieve.expand_seeds`), the person behind a salesperson or the
+   product under a category, which the question rarely names. For each strategy it reports graph recall (the
+   planner's tables, as the model would see them) and the average number of tables in the context. A good
+   strategy keeps recall high without growing the context. (A cut-off on the score gap was tried and dropped:
+   cosine scores are too bunched for it to separate relevant from noise.)
 
 To compare embedding models, build one graph per model (or one named vector set per model, `embedding.name`
 in config.yml), run this once per model with `SCHEMAGRAPH_CONFIG=<that config>` and `--out`, then `--compare`.
@@ -36,17 +39,20 @@ from pathlib import Path
 from typing import Any
 
 from schemagraph.eval.schema_metrics import schema_recall, tables_in_sql
+from schemagraph.graph import retrieve
 from schemagraph.models import SeedTable, display_name
 
 KS = (1, 3, 5, 8, 10, 20)
 SCORE_RANKS = (1, 5, 20)
 TOP_KS = (3, 5, 8, 12)
-GAPS: tuple[float | None, ...] = (None, 0.08, 0.05, 0.03)
+EXPANSIONS: tuple[tuple[int, int], ...] = ((0, 1), (2, 1), (4, 1), (4, 2))  # (max tables added, links to look)
 MISS_K = 5          # the cut-off whose misses are listed
 MAX_MISSES_SHOWN = 15
+MAX_ERROR_GROUPS = 5
 
 SearchFn = Callable[[str, str, int], list[SeedTable]]   # (db_id, question text, k) -> seeds, best first
 PlanFn = Callable[[str, list[SeedTable]], list[str]]    # (db_id, seeds) -> table uids the context would hold
+Edges = list[Any]                                       # queries.ReferenceEdge-like: from_table, to_table, confidence
 
 
 @dataclass
@@ -72,23 +78,18 @@ class QuestionResult:
 # ---------------------------------------------------------------------------
 
 
-def prune(seeds: list[SeedTable], top_k: int, gap: float | None) -> list[SeedTable]:
-    """At most `top_k` seeds, and only those scoring within `gap` of the best one. `seeds` is best first."""
-    if not seeds:
-        return []
-    kept = seeds[:top_k]
-    if gap is not None:
-        floor = seeds[0].score - gap
-        kept = [s for s in kept if s.score >= floor]
-    return kept
+def strategy_label(top_k: int, added: int = 0, hops: int = 1) -> str:
+    return f"top_k={top_k}" + (f" +{added} ({hops}-hop)" if added else "")
 
 
-def strategy_label(top_k: int, gap: float | None) -> str:
-    return f"top_k={top_k}" + ("" if gap is None else f", gap<={gap:g}")
+def strategies() -> list[tuple[int, int, int]]:
+    """(top_k, tables to add, hops) for every strategy, in report order."""
+    return [(k, n, h) for k in TOP_KS for n, h in EXPANSIONS]
 
 
-def strategies() -> list[tuple[int, float | None]]:
-    return [(k, g) for k in TOP_KS for g in GAPS]
+def seeds_for(seeds: list[SeedTable], edges: Edges, top_k: int, added: int, hops: int) -> list[SeedTable]:
+    """The seeds a strategy hands to the planner: the best `top_k`, plus what they reference."""
+    return retrieve.expand_seeds(seeds[:top_k], edges, max_added=added, hops=hops)
 
 
 def mean(values: list[float]) -> float | None:
@@ -110,7 +111,7 @@ def summarize(results: list[QuestionResult]) -> dict[str, Any]:
         "mean_score_at_rank": {str(n): mean([s for r in ok if (s := score_at_rank(r, n)) is not None]) for n in SCORE_RANKS},
         "strategies": {},
     }
-    labels = sorted({label for r in ok for label in r.graph}, key=strategy_label_key)
+    labels = list(dict.fromkeys(label for r in ok for label in r.graph))  # report order
     for label in labels:
         have = [r for r in ok if label in r.graph]
         out["strategies"][label] = {
@@ -120,12 +121,6 @@ def summarize(results: list[QuestionResult]) -> dict[str, Any]:
             "questions": len(have),
         }
     return out
-
-
-def strategy_label_key(label: str) -> tuple[int, float]:
-    """Sort key putting 'top_k=3' before 'top_k=3, gap<=0.08' and by k first."""
-    head, _, tail = label.partition(", gap<=")
-    return int(head.split("=")[1]), float(tail) if tail else 99.0
 
 
 # ---------------------------------------------------------------------------
@@ -144,6 +139,7 @@ def evaluate(
     *,
     search: SearchFn,
     plan: PlanFn | None = None,
+    edges: Edges | None = None,
     k_max: int = max(KS),
     use_evidence: bool = True,
 ) -> list[QuestionResult]:
@@ -156,13 +152,13 @@ def evaluate(
             result.seeds = [(display_name(s.uid), s.score, s.matched_on) for s in seeds]
             if plan is not None:
                 cache: dict[frozenset[str], set[str]] = {}
-                for top_k, gap in strategies():
-                    kept = prune(seeds, top_k, gap)
+                for top_k, added, hops in strategies():
+                    kept = seeds_for(seeds, edges or [], top_k, added, hops)
                     key = frozenset(s.uid for s in kept)
                     if key not in cache:
                         cache[key] = {display_name(t) for t in plan(db_id, kept)} if kept else set()
                     context = cache[key]
-                    result.graph[strategy_label(top_k, gap)] = (schema_recall(set(result.gold), context), len(context))
+                    result.graph[strategy_label(top_k, added, hops)] = (schema_recall(set(result.gold), context), len(context))
         except Exception as exc:  # noqa: BLE001 - one question failing must not stop the run
             result.error = f"{type(exc).__name__}: {exc}"
         results.append(result)
@@ -182,6 +178,12 @@ def format_report(results: list[QuestionResult], label: str = "") -> str:
     s = summarize(results)
     lines = [f"Retrieval evaluation{f' ({label})' if label else ''}: {s['questions']} questions"
              + (f", {s['errors']} errored" if s["errors"] else "")]
+    failed: dict[str, list[str]] = {}
+    for r in results:
+        if r.error is not None:
+            failed.setdefault(r.error, []).append(r.qid)
+    for message, ids in list(failed.items())[:MAX_ERROR_GROUPS]:
+        lines.append(f"  ERROR {message} ({len(ids)}: {', '.join(ids[:5])}{', ...' if len(ids) > 5 else ''})")
     if not s["questions"]:
         return "\n".join(lines + ["nothing to score"])
 
@@ -208,10 +210,10 @@ def format_report(results: list[QuestionResult], label: str = "") -> str:
         lines.append(f"  ... and {len(misses) - MAX_MISSES_SHOWN} more")
 
     if s["strategies"]:
-        lines += ["", "Seed pruning, after join planning (what the model would be given)",
-                  f"  {'strategy':<24}{'graph recall':>13}{'all gold':>10}{'tables in context':>19}"]
+        lines += ["", "Seed strategies, after join planning (what the model would be given)",
+                  f"  {'strategy':<20}{'graph recall':>13}{'all gold':>10}{'tables in context':>19}"]
         for name, v in s["strategies"].items():
-            lines.append(f"  {name:<24}{_pct(v['graph_recall']):>13}{_pct(v['all_gold']):>10}{v['context_tables']:>19.1f}")
+            lines.append(f"  {name:<20}{_pct(v['graph_recall']):>13}{_pct(v['all_gold']):>10}{v['context_tables']:>19.1f}")
         best = max(s["strategies"].items(), key=lambda kv: (kv[1]["all_gold"] or 0, -(kv[1]["context_tables"] or 0)))
         lines.append(f"  most questions fully covered: {best[0]} ({_pct(best[1]['all_gold']).strip()}% with "
                      f"{best[1]['context_tables']:.1f} tables on average)")
@@ -256,7 +258,7 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--db", help="db_id to evaluate")
     parser.add_argument("--questions-file", type=Path, action="append", default=[], help="JSONL questions with gold SQL (repeatable)")
     parser.add_argument("--split", default="all", choices=["dev", "test", "all"], help="questions to score (default all: nothing is trained here)")
-    parser.add_argument("--no-graph", action="store_true", help="skip the join-planning (seed pruning) part; recall@k only")
+    parser.add_argument("--no-graph", action="store_true", help="skip the join-planning (seed strategies) part; recall@k only")
     parser.add_argument("--no-evidence", action="store_true", help="do not append BIRD hints to the question")
     parser.add_argument("--label", default="", help="name for this run in the report and in --compare")
     parser.add_argument("--out", type=Path, help="write the results as JSON")
@@ -287,11 +289,15 @@ def main(argv: list[str] | None = None) -> int:
         def search(db_id: str, text: str, k: int) -> list[SeedTable]:
             return retrieve.retrieve_seed_tables(db_id, text, k, embedder=embedder)
 
+        from schemagraph.graph import queries
+
+        edges = [] if args.no_graph else queries.get_reference_edges(args.db)
+
         def plan(db_id: str, seeds: list[SeedTable]) -> list[str]:
             joined = planner.plan_joins(db_id, seeds)
             return joined.tables if joined.status != "none" else [s.uid for s in seeds]
 
-        results = evaluate(args.db, questions, search=search, plan=None if args.no_graph else plan,
+        results = evaluate(args.db, questions, search=search, plan=None if args.no_graph else plan, edges=edges,
                            use_evidence=not args.no_evidence)
     except Exception as exc:  # noqa: BLE001 - Neo4j, config or the question files unusable
         print(f"cannot start: {type(exc).__name__}: {exc}")

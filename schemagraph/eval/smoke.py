@@ -149,6 +149,7 @@ def run_one(
     build_context: ContextFn,
     answer: AnswerFn,
     gold: QueryResult | None = None,
+    expand: dict[str, int] | None = None,
 ) -> Row:
     """One question in one mode. Never raises: an exception becomes `row.error`."""
     from schemagraph.eval import run_eval
@@ -179,7 +180,7 @@ def run_one(
                     and results_match(gold, response.result, q.order_matters)
                 )
         else:
-            context_obj, seeds_list = build_context(db_id, q.text, mode, top_k)
+            context_obj, seeds_list = build_context(db_id, q.text, mode, top_k, **({"expand": expand} if expand else {}))
             context = {display_name(t) for t in context_obj.tables}
             row.tables = sorted(context)
             row.seeds = seed_rows(seeds_list)
@@ -203,6 +204,7 @@ def run_smoke(
     build_context: ContextFn,
     answer: AnswerFn,
     run_query: QueryFn,
+    expand: dict[str, int] | None = None,
 ) -> list[Row]:
     from schemagraph.eval.run_eval import GOLD_ROW_LIMIT
 
@@ -216,7 +218,7 @@ def run_smoke(
                 rows.append(Row(q.text, "full", q.qid, error=f"gold SQL failed: {exc}"))
         for mode in modes:
             rows.append(run_one(db_id, q, mode, use_llm=use_llm, top_k=top_k, build_context=build_context,
-                                answer=answer, gold=gold))
+                                answer=answer, gold=gold, expand=expand))
     return rows
 
 
@@ -331,6 +333,7 @@ def main(argv: list[str] | None = None) -> int:
         rows = run_smoke(
             args.db, questions, list(args.mode or MODES), use_llm=use_llm, top_k=args.top_k,
             build_context=context.build_context, answer=pipeline.answer_question, run_query=db.run_readonly_query,
+            expand=context.expand_options(getattr(config, "pipeline", None)),
         )
     except Exception as exc:  # noqa: BLE001 - Neo4j, Postgres or config unusable: nothing to show
         print(f"cannot start: {type(exc).__name__}: {exc}")

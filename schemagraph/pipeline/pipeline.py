@@ -16,7 +16,7 @@ from schemagraph.models import (
     LatencyMs,
     Metrics,
 )
-from schemagraph.pipeline.context import build_context
+from schemagraph.pipeline.context import build_context, expand_options
 from schemagraph.pipeline.examples import retrieve_examples
 from schemagraph.pipeline.explain import build_explanation, explain_context
 from schemagraph.pipeline.generate import generate_sql
@@ -65,6 +65,7 @@ def answer_question(
         top_k,
         planner_options=planner_options,
         timings=latency,
+        **({"expand": expand} if (expand := expand_options(pipeline_config)) else {}),
     )
     examples_started = time.perf_counter()
     examples = retrieve_examples(request.db_id, request.question, pipeline_config.examples_k)

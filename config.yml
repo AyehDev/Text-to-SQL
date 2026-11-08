@@ -49,6 +49,8 @@ embedding:
   # Free tier? Any provider accepts these two:
   max_wait_s: 120                # longest total wait on one rate-limited request (default 120), then it stops and keeps what is saved
   requests_per_minute: 15        # spaces requests out so the limit is not reached (default: no pacing)
+  # include_relationships: true  # embed each table with its foreign-key neighbours ("References: ... Referenced by: ...").
+  #                              # Use a new `name` with it, so the plain vectors stay for comparison.
 
 # To keep two models in one graph (for example to compare them), give each its own `name`
 # and switch between configs with SCHEMAGRAPH_CONFIG. Vectors and indexes are stored per name.
@@ -93,3 +95,5 @@ pipeline:
   row_limit: 100                   # rows returned to the caller
   examples_k: 3                    # few-shot examples (dev split only); none if the file is missing
   fewshot_path: schemagraph/eval/questions/fewshot_examples.jsonl
+  # expand_seeds: 2                # graph mode: add up to this many tables the retrieved tables have foreign keys to
+  # expand_hops: 1                 # ...looking this many links away (0 tables = off, the default)

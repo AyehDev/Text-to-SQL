@@ -70,7 +70,7 @@ weights, 7 for the two Postgres roles) refer to it.
   an optional field on `AppConfig`, secrets by environment variable name. Never put a key in `config.yml`.
 - **Chat model:** `llm` uses an OpenAI-compatible `/chat/completions` endpoint. Set the model and `api_key_env` in
   `config.yml`; the key itself belongs only in the environment. Local compatible servers can set `api_key_env: null`.
-- **Pipeline defaults:** `pipeline` supports `top_k`, `max_attempts`, `row_limit`, `examples_k`, and `fewshot_path`.
+- **Pipeline defaults:** `pipeline` supports `top_k`, `max_attempts`, `row_limit`, `examples_k`, `fewshot_path`, and (off by default) `expand_seeds` / `expand_hops`.
   Few-shot files must contain development examples only.
 
 Example additions to `config.yml`:
@@ -255,11 +255,21 @@ python scripts/retrieval_eval.py --compare runs/openai.json runs/gemini.json    
 
 It embeds each question once and reports (1) recall@k: how many of the tables the gold SQL reads are among the k
 best-scoring tables, (2) the mean score at ranks 1, 5 and 20, which shows whether scores separate relevant tables from
-noise, and (3) for each seed-pruning strategy (`top_k` and a score `gap` below the best), the planner's context as the
-model would see it: recall and the average number of tables. Use it to choose `top_k` and to compare embedding
-models: build one graph (or one named vector set, `embedding.name`) per model, run once per model with
-`SCHEMAGRAPH_CONFIG=<config>` and `--out`, then `--compare`. Runs are comparable only on the same question file and split.
+noise, and (3) for each seed strategy (`top_k`, with or without adding up to N tables the seeds have foreign keys to),
+the planner's context as the model would see it: recall and the average number of tables. Use it to choose `top_k`
+and to compare embedding models and embedding texts: build one graph (or one named vector set, `embedding.name`)
+per variant, run once per variant with `SCHEMAGRAPH_CONFIG=<config>` and `--out`, then `--compare`. Runs are
+comparable only on the same question file and split.
 `--no-graph` skips the planning part.
+
+Two ways to bring in tables a question never names (the person behind a salesperson, the product under a category):
+
+- `embedding.include_relationships: true` embeds each table with its foreign-key neighbours, so a link table matches
+  questions about what it links. It changes the embedded text; give the config a new `embedding.name` and run
+  `python scripts/build_graph.py --db <db> --skip-extraction` to embed under it (the plain vectors are kept).
+- `pipeline.expand_seeds: N` (graph mode) adds up to N tables that the retrieved tables reference, `expand_hops` links
+  away, before join planning. The retrieval script's `+N (H-hop)` rows measure it before you turn it on; the
+  explanation marks an added table "Added because X has a foreign key to it".
 
 ## API reference
 

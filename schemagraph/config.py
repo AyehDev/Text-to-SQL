@@ -149,6 +149,10 @@ class EmbeddingConfig(BaseModel):
     api_key_env: str | None = None         # default: OPENAI_API_KEY / VOYAGE_API_KEY; null means no key
     send_dimensions: bool = False          # ask the API for shortened vectors (OpenAI v3, Voyage 4 support it)
     batch_size: int = Field(default=64, ge=1)   # texts per request (gemini: 100 unless set)
+    # Add each table's foreign-key neighbours to its embedded text ("References: ... Referenced by: ..."),
+    # so link tables (product, person) match questions about what they link. Changing it changes the text,
+    # so embed under a new `name` (or the stored vectors are recomputed) and compare with retrieval_eval.
+    include_relationships: bool = False
     timeout_s: float = Field(default=30.0, gt=0)
     max_wait_s: float = Field(default=120.0, ge=0)             # longest total wait on one rate-limited request
     requests_per_minute: int | None = Field(default=None, ge=1)  # pace calls to stay under a free-tier limit
@@ -223,6 +227,10 @@ class PipelineConfig(BaseModel):
     row_limit: int = Field(default=100, ge=1, le=100_000)
     examples_k: int = Field(default=3, ge=0, le=20)
     fewshot_path: Path = Path("schemagraph/eval/questions/fewshot_examples.jsonl")
+    # Graph mode: after retrieval, add up to `expand_seeds` tables that the retrieved tables have foreign keys to
+    # (looking `expand_hops` links away), best-shared first, before join planning. 0 turns it off.
+    expand_seeds: int = Field(default=0, ge=0, le=20)
+    expand_hops: int = Field(default=1, ge=1, le=3)
 
 
 class AppConfig(BaseModel):
