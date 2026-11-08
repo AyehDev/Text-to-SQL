@@ -451,6 +451,23 @@ python -m schemagraph.eval.run_eval --questions schemagraph/eval/questions/adven
 python -m schemagraph.eval.run_eval --summarize results/RUN.jsonl
 ```
 
+### Compare retrieval settings end to end
+
+Retrieval recall says whether the right tables arrive; only a model run says whether more tables help or hurt the SQL.
+`--sweep` runs the same questions once per variant, `K` (top_k), `K+N` (also add up to N tables the seeds reference) or
+`K+N:H` (looking H links away), and prints one row per variant with accuracy, schema recall, tables in the context,
+tries, tokens and latency:
+
+```bash
+python -m schemagraph.eval.run_eval --questions schemagraph/eval/questions/adventureworks.jsonl \
+    --modes graph --sweep 5 8 12 5+4:2 8+4:2 --out results/sweep.jsonl --run-id sweep --llm-model <model>
+python -m schemagraph.eval.run_eval --compare-runs results/sweep.jsonl      # the table again, any time
+```
+
+Each variant is its own run id (`sweep-k8+4h2`), so an interrupted sweep resumes and finished rows are never asked
+twice. It prints how many model calls it may make first (questions x modes x variants). `--top-k` and `--expand N[:H]`
+override the config for a single ordinary run. Use the test split for the final choice and the dev split while exploring.
+
 ### Building the question files
 
 `bird_subset.jsonl` is generated from BIRD's own questions (the `mini_dev_postgresql.json` that `scripts/load_bird.sh` copies

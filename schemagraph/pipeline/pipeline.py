@@ -35,11 +35,15 @@ def answer_question(
     explain: bool = True,
     *,
     planner_options: dict | None = None,
+    expand: dict | None = None,
 ) -> AskResponse:
     """Answer one question; the evaluation harness uses this same entry point.
 
     Model-written SQL is parsed, explained, then run only through the read-only
     database API. Service/network failures propagate to the API's error mapping.
+
+    `expand` ({"max_added": N, "hops": H}) overrides the config's `pipeline.expand_seeds` for this
+    call (the evaluation sweeps use it); N = 0 turns expansion off. None uses the config.
     """
     started_total = time.perf_counter()
     config = get_config()
@@ -65,7 +69,7 @@ def answer_question(
         top_k,
         planner_options=planner_options,
         timings=latency,
-        **({"expand": expand} if (expand := expand_options(pipeline_config)) else {}),
+        **({"expand": use_expand} if (use_expand := expand if expand is not None else expand_options(pipeline_config)) else {}),
     )
     examples_started = time.perf_counter()
     examples = retrieve_examples(request.db_id, request.question, pipeline_config.examples_k)

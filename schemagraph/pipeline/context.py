@@ -126,7 +126,7 @@ def build_context(
         elapsed["retrieval"] = round((perf_counter() - started) * 1000)
         if mode == "graph" and seeds:
             started = perf_counter()
-            if expand:  # add the tables the seeds reference, which the question may not name (retrieve.expand_seeds)
+            if expand and expand.get("max_added", 0) > 0:  # add the tables the seeds reference, which the question may not name (retrieve.expand_seeds)
                 edges = queries.get_reference_edges(
                     db_id, include_inferred=(planner_options or {}).get("include_inferred", True)
                 )
