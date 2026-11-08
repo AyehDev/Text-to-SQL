@@ -431,7 +431,10 @@ to `data/bird/`), not written by hand:
 ```bash
 python -m schemagraph.eval.bird_questions --input data/bird/mini_dev_postgresql.json \
     --out schemagraph/eval/questions/bird_subset.jsonl --verify      # --verify needs the BIRD databases loaded
-python -m schemagraph.eval.question_set schemagraph/eval/questions/*.jsonl      # checks any question files
+# check the question files (list them; fewshot_examples.jsonl is not a question file) and the few-shot examples:
+python -m schemagraph.eval.question_set schemagraph/eval/questions/adventureworks.jsonl \
+    schemagraph/eval/questions/bird_subset.jsonl --fewshot schemagraph/eval/questions/fewshot_examples.jsonl
+# add --verify to also run every gold query against the loaded databases
 ```
 
 With `--verify`, failed gold queries are printed grouped by message. If at least half of all questions fail for one
@@ -445,6 +448,17 @@ scorer, which ignores row order); those questions say so in `notes`. `--verify` 
 that fail, time out, or return no rows. `question_set.py` also catches duplicate ids and questions, gold SQL that is not
 a single safe SELECT, and any overlap with `fewshot_examples.jsonl` (`--fewshot`). The questions not chosen are a pool for
 few-shot examples.
+
+`adventureworks.jsonl` is hand-written: 50 `test` questions (10 / 15 / 25 at tiers 1 / 2 / 3) and 10 `dev` questions, each with
+gold SQL that was run against a real AdventureWorks and checked to run, return rows and have one clear answer (ranking
+questions have no ties at the cut-off). The tier is again the number of distinct tables in the gold query, the same rule as
+for BIRD, so tier 3 here means three or more tables, not "crosses schemas". Date-dependent questions fit this sample's dates
+(orders 2022-05 to 2025-06, hire dates 2006 to 2013); the `notes` field says where a question depends on a reading such as
+"currently". They are drafts: read them and edit any whose wording or gold SQL you would not defend.
+
+`fewshot_examples.jsonl` holds every `dev` question of both files, the only questions the model may see as examples
+(`retrieve_examples` filters by database and refuses any example that is not `dev`). The checker flags a few-shot
+example that is not a `dev` question, and any `test` question that also appears there.
 
 `--check-gold` runs every gold query first and reports failures and queries that return no rows; a real run does the
 same check before any model call. A run is resumable: repeat the command with the same `--run-id` and finished rows are
