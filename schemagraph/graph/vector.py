@@ -17,13 +17,16 @@ database, kept apart by the db_id property on every node.
 
 from __future__ import annotations
 
+import hashlib
 import json
 import logging
 import re
+import sqlite3
 import time
 import urllib.error
 import urllib.request
 from collections.abc import Callable
+from pathlib import Path
 from typing import Any, NamedTuple, Protocol
 
 from schemagraph.config import EmbeddingConfig, get_config
@@ -72,6 +75,50 @@ def retry_after_seconds(header: str | None, body: str = "") -> float | None:
 
 class Embedder(Protocol):
     def embed_query(self, text: str) -> list[float]: ...
+
+
+class QueryCache:
+    """Question embeddings kept in a SQLite file. Best effort: a cache that cannot be read or written is skipped.
+
+    A connection is opened per call, so several threads (the API's workers) and processes can share the file.
+    """
+
+    def __init__(self, path: str | Path) -> None:
+        self.path = Path(path)
+
+    @staticmethod
+    def key(config: EmbeddingConfig, text: str) -> str:
+        parts = [config.provider, config.model, str(config.dimensions), str(config.send_dimensions), text]
+        return hashlib.sha256("\x00".join(parts).encode()).hexdigest()
+
+    def _connect(self) -> sqlite3.Connection:
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        conn = sqlite3.connect(self.path, timeout=10)
+        conn.execute("CREATE TABLE IF NOT EXISTS query_embedding (key TEXT PRIMARY KEY, vector TEXT NOT NULL)")
+        return conn
+
+    def get(self, key: str) -> list[float] | None:
+        try:
+            conn = self._connect()
+            try:
+                row = conn.execute("SELECT vector FROM query_embedding WHERE key = ?", (key,)).fetchone()
+            finally:
+                conn.close()
+            return [float(x) for x in json.loads(row[0])] if row else None
+        except (OSError, sqlite3.Error, ValueError):
+            log.debug("query cache unreadable: %s", self.path, exc_info=True)
+            return None
+
+    def put(self, key: str, vector: list[float]) -> None:
+        try:
+            conn = self._connect()
+            try:
+                with conn:
+                    conn.execute("INSERT OR REPLACE INTO query_embedding VALUES (?, ?)", (key, json.dumps(vector)))
+            finally:
+                conn.close()
+        except (OSError, sqlite3.Error):
+            log.debug("query cache unwritable: %s", self.path, exc_info=True)
 
     def embed_documents(self, texts: list[str]) -> list[list[float]]: ...
 
@@ -198,9 +245,43 @@ class _HttpEmbedder:
         self._retries = retries
         self._clock = clock
         self._next_request_at: float | None = None
+        self._query_cache = QueryCache(config.query_cache) if config.query_cache else None
 
     def embed_query(self, text: str) -> list[float]:
-        return self._embed([text], "query")[0]
+        cache = self._query_cache
+        if cache is None:
+            return self._embed([text], "query")[0]
+        key = cache.key(self.config, text)
+        cached = cache.get(key)
+        if cached is not None and len(cached) == self.config.dimensions:
+            return cached
+        vector = self._embed([text], "query")[0]
+        cache.put(key, vector)
+        return vector
+
+    def prefetch_queries(self, texts: list[str]) -> int:
+        """Embed and cache every question not cached yet, `batch_size` per request. Returns how many were fetched.
+
+        An evaluation knows all its questions up front, so this costs one request per batch instead of one per
+        question, which is what a free tier's daily request limit counts. Each batch is stored as it arrives, so a
+        failure part-way keeps what was done. Does nothing (returns 0) when no `query_cache` is configured.
+        """
+        cache = self._query_cache
+        if cache is None:
+            return 0
+        missing: dict[str, str] = {}
+        for text in dict.fromkeys(texts):
+            key = cache.key(self.config, text)
+            hit = cache.get(key)
+            if hit is None or len(hit) != self.config.dimensions:
+                missing[key] = text
+        items = list(missing.items())
+        size = self.config.batch_size
+        for i in range(0, len(items), size):
+            chunk = items[i : i + size]
+            for (key, _), vec in zip(chunk, self._embed_batch([text for _, text in chunk], "query"), strict=True):
+                cache.put(key, vec)
+        return len(items)
 
     def embed_documents(self, texts: list[str]) -> list[list[float]]:
         return self._embed(texts, "document")

@@ -49,6 +49,8 @@ embedding:
   # Free tier? Any provider accepts these two:
   max_wait_s: 120                # longest total wait on one rate-limited request (default 120), then it stops and keeps what is saved
   requests_per_minute: 15        # spaces requests out so the limit is not reached (default: no pacing)
+  query_cache: data/cache/query_embeddings.sqlite   # each question is embedded once, however many modes, sweeps and reruns ask it
+                                 # (free tiers count every embedding call; delete the file to start over; remove the line to turn it off)
   # include_relationships: true  # embed each table with its foreign-key neighbours ("References: ... Referenced by: ...").
   #                              # Use a new `name` with it, so the plain vectors stay for comparison.
 

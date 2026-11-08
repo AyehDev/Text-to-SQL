@@ -128,3 +128,96 @@ def test_report_names_the_errors_grouped_by_message():
     qs = [Q("a", "SELECT * FROM t", "q1"), Q("b", "SELECT * FROM t", "q2"), Q("c", "SELECT * FROM t", "q1")]
     text = re_.format_report(re_.evaluate("db", qs, search=search))
     assert "ERROR RuntimeError: 429 slow down (2: a, c)" in text and "ERROR KeyError: 'x' (1: b)" in text
+
+
+# ---------------------------------------------------------------------------
+# Several databases in one run (BIRD)
+# ---------------------------------------------------------------------------
+
+
+def question_line(qid, db_id, sql, split="test"):
+    return json.dumps({"id": qid, "db_id": db_id, "question": f"question {qid}", "gold_sql": sql, "tier": 1,
+                       "split": split, "order_matters": False, "evidence": None, "author": "t", "notes": ""})
+
+
+def fake_services(monkeypatch, searched):
+    from schemagraph.graph import driver, planner, queries, retrieve, vector
+
+    def search(db_id, text, k, embedder=None):
+        searched.append((db_id, k))
+        return [SeedTable(uid=f"{db_id}:public.{t}", score=0.9 - 0.01 * i, matched_on="table")
+                for i, t in enumerate(["a", "b", "c"], start=1)]
+
+    monkeypatch.setattr(driver, "check_connection", lambda: None)
+    monkeypatch.setattr(driver, "close_driver", lambda: None)
+    monkeypatch.setattr(vector, "get_embedder", lambda: object())
+    monkeypatch.setattr(retrieve, "retrieve_seed_tables", search)
+    monkeypatch.setattr(queries, "get_reference_edges", lambda db_id: [])
+    monkeypatch.setattr(planner, "plan_joins", lambda db_id, seeds: type("J", (), {"status": "none", "tables": []})())
+
+
+def test_strategies_follow_the_requested_top_k_values():
+    assert [k for k, _, _ in re_.strategies((2,))] == [2] * len(re_.EXPANSIONS)
+    assert {k for k, _, _ in re_.strategies()} == set(re_.TOP_KS)
+
+
+def test_results_remember_their_database_and_report_per_database_rows():
+    one = re_.evaluate("alpha", [Q("a1", "SELECT * FROM public.a")], search=lambda d, t, k: [seed("public.a", 0.9)])
+    two = re_.evaluate("beta", [Q("b1", "SELECT * FROM public.zzz")], search=lambda d, t, k: [seed("public.a", 0.9)])
+    assert one[0].db_id == "alpha"
+    text = re_.format_report(one + two)
+    assert "By database" in text
+    alpha = next(line for line in text.splitlines() if line.strip().startswith("alpha"))
+    beta = next(line for line in text.splitlines() if line.strip().startswith("beta"))
+    assert alpha.split()[-3:] == ["100.0", "100.0", "100.0"] and beta.split()[-3:] == ["0.0", "0.0", "0.0"]
+    assert "By database" not in re_.format_report(one)
+    assert re_.to_json(one, "alpha", "x", "all")["questions"][0]["db_id"] == "alpha"
+
+
+def test_cli_scores_every_database_in_the_file_when_no_db_is_given(tmp_path, monkeypatch, capsys):
+    searched = []
+    fake_services(monkeypatch, searched)
+    path = tmp_path / "q.jsonl"
+    path.write_text("\n".join([question_line("q1", "alpha", "SELECT * FROM public.a"),
+                               question_line("q2", "beta", "SELECT * FROM public.b"),
+                               question_line("q3", "beta", "SELECT * FROM public.c", split="dev")]))
+    out = tmp_path / "run.json"
+    code = re_.main(["--questions-file", str(path), "--split", "test", "--top-k", "2", "--out", str(out)])
+    text = capsys.readouterr().out
+    assert code == 0
+    assert sorted(db for db, _ in searched) == ["alpha", "beta"]        # the dev question is not scored
+    assert "By database" in text and "top_k=2" in text and "top_k=3 " not in text
+    saved = json.loads(out.read_text())
+    assert saved["db_id"] == "alpha,beta" and saved["summary"]["questions"] == 2
+
+
+def test_cli_db_flag_limits_the_run_and_reports_unknown_databases(tmp_path, monkeypatch, capsys):
+    searched = []
+    fake_services(monkeypatch, searched)
+    path = tmp_path / "q.jsonl"
+    path.write_text("\n".join([question_line("q1", "alpha", "SELECT * FROM public.a"),
+                               question_line("q2", "beta", "SELECT * FROM public.b")]))
+    assert re_.main(["--questions-file", str(path), "--db", "beta", "--no-graph"]) == 0
+    assert [db for db, _ in searched] == ["beta"]
+    assert re_.main(["--questions-file", str(path), "--db", "gamma"]) == 2
+    assert "no questions (all split) for 'gamma'" in capsys.readouterr().out
+
+
+def test_cli_embeds_all_questions_in_advance_when_the_embedder_can(tmp_path, monkeypatch, capsys):
+    from schemagraph.graph import vector
+
+    fake_services(monkeypatch, [])
+    seen = []
+
+    class Embedder:
+        def prefetch_queries(self, texts):
+            seen.append(texts)
+            return len(texts)
+
+    monkeypatch.setattr(vector, "get_embedder", lambda: Embedder())
+    path = tmp_path / "q.jsonl"
+    path.write_text("\n".join([question_line("q1", "alpha", "SELECT * FROM public.a"),
+                               question_line("q2", "beta", "SELECT * FROM public.b")]))
+    assert re_.main(["--questions-file", str(path), "--no-graph"]) == 0
+    assert seen == [["question q1", "question q2"]]
+    assert "embedded 2 new questions in advance" in capsys.readouterr().out

@@ -227,6 +227,16 @@ Vectors written before fingerprints existed are replaced once. In `config.yml` u
 otherwise, which matters on tiers limited by requests per minute. Retrieval skips nodes without a vector, so do not rely on a
 partial graph for answers; the coverage numbers in the summary say how far it got.
 
+**Embedding quota.** Every `retrieval` and `graph` call embeds its question, and free tiers count each call against a daily
+limit, so a sweep over four settings would embed each question four times. With `embedding.query_cache` set (it is in
+`config.yml`), a question is embedded once and reused from `data/cache/query_embeddings.sqlite` by every mode, setting and
+rerun; the key includes the provider, model and dimensions, so changing the model starts fresh. `run_eval` and `retrieval_eval`
+also embed all their questions in advance, `batch_size` per request (one request for up to 100 questions), before the first
+model call; if the quota is already gone, `run_eval` says so and exits with status 3 before running anything. If the service still refuses
+three questions in a row (quota used up), `run_eval` stops instead of failing the rest, prints `STOPPED: ...`, exits with
+status 3 and keeps every finished row: rerun the same command later (a daily quota resets overnight, Pacific time for Google) and it
+carries on from where it stopped. `--modes full` needs no embedding at all.
+
 ### Smoke test the whole path
 
 After building a graph, push a few questions through the real services before any long run:
@@ -486,6 +496,30 @@ twice. It prints how many model calls it may make first (questions x modes x var
 override the config for a single ordinary run. Use the test split for the final choice and the dev split while exploring. Dev questions are also the few-shot examples, so `run_eval` tells the pipeline to leave a question's own
 example out of its prompt (`exclude_example_ids`); without that, a dev run would show the model the answer.
 
+### Evaluate on BIRD
+
+BIRD's eleven databases are small (3 to 13 tables each) and each question reads 2.3 tables on average, so a `top_k` of
+8 hands the model the whole schema for 49 of the 60 questions and tells you nothing about retrieval. Use `top_k` 2 to 5
+here. Build only the eleven BIRD graphs (not `--all`, which would also pick up `bird_staging`; drop that database once
+the split is done):
+
+```bash
+NAMES=$(grep -v '^\(#\|$\)' scripts/bird_tables.tsv | cut -f1 | sort -u)       # the eleven db_ids
+python scripts/build_graph.py $(sed 's/^/--db /' <<< "$NAMES") --skip-extraction   # per-db metadata files are in data/metadata/
+```
+
+1. **Held-out inference.** Hide every declared foreign key and see how many come back (needs the databases, for the
+   value-overlap check). One run per database; `debit_card_specializing` declares none, so it only shows what inference adds:
+   `for d in $NAMES; do python -m schemagraph.eval.infer_recovery --db $d --fraction 1.0 --seeds 1; done`
+2. **Retrieval alone** (no LLM), all eleven databases in one report with a per-database table:
+   `python scripts/retrieval_eval.py --questions-file schemagraph/eval/questions/bird_subset.jsonl --top-k 2 3 5 --label bird --out runs/bird.json`.
+   A database with at most 20 tables must reach 100% at k=20; if one does not, the shared vector index is cutting
+   candidates before the `db_id` filter and `DEFAULT_CANDIDATES` in `graph/retrieve.py` needs raising.
+3. **End to end**, modes and settings:
+   `python -m schemagraph.eval.run_eval --questions schemagraph/eval/questions/bird_subset.jsonl --modes full retrieval graph --top-k 3 --out results/bird-modes.jsonl --run-id bird-modes --llm-model <model>`
+   and `--modes graph --sweep 2 3 5 2+2:1 3+2:1 --out results/bird-sweep.jsonl --run-id bird-sweep`, then `--compare-runs`.
+   Run it once more with `--no-evidence` to see how much BIRD's hint is doing.
+
 ### Building the question files
 
 `bird_subset.jsonl` is generated from BIRD's own questions (the `mini_dev_postgresql.json` that `scripts/load_bird.sh` copies
@@ -562,7 +596,11 @@ Before you push, run once with everything you have available. A skipped test has
 
 ## Known limits
 
-- Relationship inference was tuned on AdventureWorks. Its accuracy on other databases is not measured yet; BIRD is the planned test.
+- Relationship inference was tuned on AdventureWorks. On BIRD the name rules can reach only 43 of the 87 declared single-column
+  foreign keys (49%), against 86 of 89 (97%) on AdventureWorks: none in `codebase_community`, `student_club` or
+  `thrombosis_prediction`, which name keys `userid`, `link_to_member` or a bare `id`. That is the ceiling before the data check;
+  the recovered/wrong/extra counts need `infer_recovery` run with the databases (step 1 of "Evaluate on BIRD"). Rules changed to
+  fix BIRD are no longer held out.
 - Inference proposes single-column relationships only. Declared composite keys are extracted correctly.
 - Two tables with identical key sets cannot be told apart by the data, so inference picks one deterministically.
 - The Postgres wrapper is Postgres-only by choice; abstracting it for other engines was deferred.

@@ -3,6 +3,7 @@
     python scripts/retrieval_eval.py --db adventureworks --questions-file schemagraph/eval/questions/adventureworks.jsonl
     python scripts/retrieval_eval.py --db adventureworks --questions-file ... --split all --out runs/gemini.json --label gemini-1536
     python scripts/retrieval_eval.py --compare runs/openai.json runs/gemini.json
+    python scripts/retrieval_eval.py --questions-file schemagraph/eval/questions/bird_subset.jsonl --top-k 2 3 5
 
 No LLM and no Postgres are involved, so a run is cheap and repeatable: it embeds each question once and
 reads Neo4j. For every question with gold SQL it asks three things.
@@ -21,6 +22,10 @@ reads Neo4j. For every question with gold SQL it asks three things.
    strategy keeps recall high without growing the context. (A cut-off on the score gap was tried and dropped:
    cosine scores are too bunched for it to separate relevant from noise.)
 
+Without --db, every database named in the question files is scored (BIRD has eleven, each with only 3 to 13 tables),
+with a per-database table when there is more than one. A top_k at or above a database's table count shows it whole, so
+on small schemas use --top-k 2 3 5 to see any pruning at all.
+
 To compare embedding models, build one graph per model (or one named vector set per model, `embedding.name`
 in config.yml), run this once per model with `SCHEMAGRAPH_CONFIG=<that config>` and `--out`, then `--compare`.
 Results are only comparable between runs on the same question file and split.
@@ -33,7 +38,7 @@ from __future__ import annotations
 import argparse
 import json
 import statistics
-from collections.abc import Callable
+from collections.abc import Callable, Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -42,7 +47,8 @@ from schemagraph.eval.schema_metrics import schema_recall, tables_in_sql
 from schemagraph.graph import retrieve
 from schemagraph.models import SeedTable, display_name
 
-KS = (1, 3, 5, 8, 10, 20)
+KS = (1, 2, 3, 5, 8, 10, 20)
+BY_DB_KS = (1, 3, 5)  # cut-offs shown in the per-database table
 SCORE_RANKS = (1, 5, 20)
 TOP_KS = (3, 5, 8, 12)
 EXPANSIONS: tuple[tuple[int, int], ...] = ((0, 1), (2, 1), (4, 1), (4, 2))  # (max tables added, links to look)
@@ -60,6 +66,7 @@ class QuestionResult:
     qid: str
     question: str
     gold: list[str]                                    # 'schema.table' names the gold SQL reads
+    db_id: str = ""
     seeds: list[tuple[str, float, str]] = field(default_factory=list)   # (display name, score, matched_on), best first
     graph: dict[str, tuple[float, int]] = field(default_factory=dict)   # strategy label -> (graph recall, context size)
     error: str | None = None
@@ -82,9 +89,9 @@ def strategy_label(top_k: int, added: int = 0, hops: int = 1) -> str:
     return f"top_k={top_k}" + (f" +{added} ({hops}-hop)" if added else "")
 
 
-def strategies() -> list[tuple[int, int, int]]:
+def strategies(top_ks: Sequence[int] = TOP_KS) -> list[tuple[int, int, int]]:
     """(top_k, tables to add, hops) for every strategy, in report order."""
-    return [(k, n, h) for k in TOP_KS for n, h in EXPANSIONS]
+    return [(k, n, h) for k in top_ks for n, h in EXPANSIONS]
 
 
 def seeds_for(seeds: list[SeedTable], edges: Edges, top_k: int, added: int, hops: int) -> list[SeedTable]:
@@ -142,17 +149,18 @@ def evaluate(
     edges: Edges | None = None,
     k_max: int = max(KS),
     use_evidence: bool = True,
+    top_ks: Sequence[int] = TOP_KS,
 ) -> list[QuestionResult]:
     """Retrieve once per question (k_max seeds), then score every cut-off and strategy from that one list."""
     results: list[QuestionResult] = []
     for q in questions:
-        result = QuestionResult(qid=q.id, question=q.question, gold=sorted(tables_in_sql(q.gold_sql)))
+        result = QuestionResult(qid=q.id, question=q.question, gold=sorted(tables_in_sql(q.gold_sql)), db_id=db_id)
         try:
             seeds = search(db_id, question_text(q, use_evidence), k_max)
             result.seeds = [(display_name(s.uid), s.score, s.matched_on) for s in seeds]
             if plan is not None:
                 cache: dict[frozenset[str], set[str]] = {}
-                for top_k, added, hops in strategies():
+                for top_k, added, hops in strategies(top_ks):
                     kept = seeds_for(seeds, edges or [], top_k, added, hops)
                     key = frozenset(s.uid for s in kept)
                     if key not in cache:
@@ -192,6 +200,15 @@ def format_report(results: list[QuestionResult], label: str = "") -> str:
               "  mean recall  " + "".join(f"{_pct(s['recall_at'][str(k)]):>7}" for k in KS),
               "  all found    " + "".join(f"{_pct(s['all_gold_at'][str(k)]):>7}" for k in KS)]
 
+    by_db = sorted({r.db_id for r in results if r.db_id})
+    if len(by_db) > 1:
+        lines += ["", "By database: questions with every gold table among the k best-scoring tables (percent)",
+                  f"  {'database':<26}{'questions':>10}" + "".join(f"{'k=' + str(k):>7}" for k in BY_DB_KS)]
+        for name in by_db:
+            ok = [r for r in results if r.db_id == name and r.error is None and r.gold]
+            cells = "".join(f"{_pct(mean([float(r.recall_at(k) == 1.0) for r in ok])):>7}" for k in BY_DB_KS)
+            lines.append(f"  {name:<26}{len(ok):>10}{cells}")
+
     scores = s["mean_score_at_rank"]
     lines += ["", "Mean score at rank " + ", ".join(
         f"{n}: {scores[str(n)]:.3f}" if scores[str(n)] is not None else f"{n}: n/a" for n in SCORE_RANKS)]
@@ -224,7 +241,7 @@ def to_json(results: list[QuestionResult], db_id: str, label: str, split: str) -
     return {
         "label": label, "db_id": db_id, "split": split, "summary": summarize(results),
         "questions": [
-            {"id": r.qid, "gold": r.gold, "seeds": r.seeds, "graph": r.graph, "error": r.error} for r in results
+            {"id": r.qid, "db_id": r.db_id, "gold": r.gold, "seeds": r.seeds, "graph": r.graph, "error": r.error} for r in results
         ],
     }
 
@@ -255,7 +272,9 @@ def format_comparison(runs: list[dict[str, Any]]) -> str:
 
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description="Score retrieval (recall@k, score spread, seed pruning) against gold SQL.")
-    parser.add_argument("--db", help="db_id to evaluate")
+    parser.add_argument("--db", action="append", default=[],
+                        help="db_id to evaluate (repeatable; default: every db_id in the question files)")
+    parser.add_argument("--top-k", type=int, nargs="+", metavar="K", help=f"top_k values for the seed strategies (default {' '.join(map(str, TOP_KS))})")
     parser.add_argument("--questions-file", type=Path, action="append", default=[], help="JSONL questions with gold SQL (repeatable)")
     parser.add_argument("--split", default="all", choices=["dev", "test", "all"], help="questions to score (default all: nothing is trained here)")
     parser.add_argument("--no-graph", action="store_true", help="skip the join-planning (seed strategies) part; recall@k only")
@@ -269,36 +288,48 @@ def main(argv: list[str] | None = None) -> int:
         runs = [json.loads(p.read_text(encoding="utf-8")) for p in args.compare]
         print(format_comparison(runs))
         return 0
-    if not args.db or not args.questions_file:
-        parser.error("--db and at least one --questions-file are required (or use --compare)")
+    if not args.questions_file:
+        parser.error("at least one --questions-file is required (or use --compare)")
+    if args.top_k and min(args.top_k) < 1:
+        parser.error("--top-k values must be at least 1")
 
     from schemagraph.eval import run_eval
     from schemagraph.graph import driver
 
     try:
-        questions = [q for q in run_eval.load_question_files(args.questions_file, args.split) if q.db_id == args.db]
-        if not questions:
-            print(f"no {args.split} questions for {args.db!r} in {', '.join(map(str, args.questions_file))}")
+        loaded = run_eval.load_question_files(args.questions_file, args.split)
+        wanted = args.db or sorted({q.db_id for q in loaded})
+        by_db = {name: [q for q in loaded if q.db_id == name] for name in wanted}
+        empty = [name for name, qs in by_db.items() if not qs]
+        if empty or not by_db:
+            names = ", ".join(map(repr, empty)) or "any database"
+            print(f"no questions ({args.split} split) for {names} in {', '.join(map(str, args.questions_file))}")
             return 2
         driver.check_connection()
 
         from schemagraph.graph import planner, retrieve, vector
 
         embedder = vector.get_embedder()
+        prefetch = getattr(embedder, "prefetch_queries", None)   # all questions in a few batched requests (needs query_cache)
+        if prefetch:
+            fetched = prefetch([question_text(q, not args.no_evidence) for qs in by_db.values() for q in qs])
+            if fetched:
+                print(f"embedded {fetched} new questions in advance (cached in embedding.query_cache)")
 
         def search(db_id: str, text: str, k: int) -> list[SeedTable]:
             return retrieve.retrieve_seed_tables(db_id, text, k, embedder=embedder)
 
         from schemagraph.graph import queries
 
-        edges = [] if args.no_graph else queries.get_reference_edges(args.db)
-
         def plan(db_id: str, seeds: list[SeedTable]) -> list[str]:
             joined = planner.plan_joins(db_id, seeds)
             return joined.tables if joined.status != "none" else [s.uid for s in seeds]
 
-        results = evaluate(args.db, questions, search=search, plan=None if args.no_graph else plan, edges=edges,
-                           use_evidence=not args.no_evidence)
+        results: list[QuestionResult] = []
+        for name, questions in by_db.items():
+            edges = [] if args.no_graph else queries.get_reference_edges(name)
+            results += evaluate(name, questions, search=search, plan=None if args.no_graph else plan, edges=edges,
+                                use_evidence=not args.no_evidence, top_ks=args.top_k or TOP_KS)
     except Exception as exc:  # noqa: BLE001 - Neo4j, config or the question files unusable
         print(f"cannot start: {type(exc).__name__}: {exc}")
         return 2
@@ -308,7 +339,7 @@ def main(argv: list[str] | None = None) -> int:
     print(format_report(results, args.label))
     if args.out:
         args.out.parent.mkdir(parents=True, exist_ok=True)
-        args.out.write_text(json.dumps(to_json(results, args.db, args.label, args.split), indent=1), encoding="utf-8")
+        args.out.write_text(json.dumps(to_json(results, ",".join(wanted), args.label, args.split), indent=1), encoding="utf-8")
         print(f"\nwrote {args.out}")
     return 0 if all(r.error is None for r in results) else 1
 

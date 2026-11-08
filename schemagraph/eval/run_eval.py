@@ -33,6 +33,7 @@ from pydantic import ValidationError
 
 from schemagraph.eval.compare import results_match
 from schemagraph.eval.schema_metrics import bridge_tables_needed, schema_recall, tables_in_sql
+from schemagraph.graph.vector import RateLimited
 from schemagraph.models import (
     AskOptions,
     AskRequest,
@@ -47,6 +48,8 @@ from schemagraph.models import (
 log = logging.getLogger(__name__)
 
 GOLD_ROW_LIMIT = 100_000  # large enough that neither the gold nor the generated result is truncated
+MAX_RATE_LIMITED_IN_A_ROW = 3  # embedding quota refusals before a run gives up (rows already written are kept)
+EXIT_QUOTA = 3
 
 AnswerFn = Callable[..., AskResponse]
 QueryFn = Callable[[str, str, int], QueryResult]
@@ -210,6 +213,7 @@ class RunReport:
     already_done: int = 0
     skipped_bad_gold: dict[str, str] = field(default_factory=dict)
     errors: list[tuple[str, str, str]] = field(default_factory=list)  # (question id, mode, message)
+    stopped: str | None = None  # why the run ended early (embedding quota), else None
 
 
 class GoldError(RuntimeError):
@@ -232,6 +236,24 @@ def load_results(path: Path, run_id: str | None = None) -> list[EvalResult]:
             if run_id is None or row.run_id == run_id:
                 results.append(row)
     return results
+
+
+def question_text(q: Question, use_evidence: bool = True) -> str:
+    """What the pipeline is asked: the question, with BIRD's hint appended when there is one."""
+    return f"{q.question}\nHint: {q.evidence}" if use_evidence and q.evidence else q.question
+
+
+def warm_query_cache(questions: list[Question], use_evidence: bool = True, embedder: Any = None) -> int:
+    """Embed every question in a few batched requests before the run, so it never pays per question.
+
+    Returns how many were embedded (0 if all were cached or no `embedding.query_cache` is set).
+    """
+    if embedder is None:
+        from schemagraph.graph import vector
+
+        embedder = vector.get_embedder()
+    prefetch = getattr(embedder, "prefetch_queries", None)
+    return prefetch([question_text(q, use_evidence) for q in questions]) if prefetch else 0
 
 
 def run_eval(
@@ -280,9 +302,10 @@ def run_eval(
     done = {(r.question_id, r.mode) for r in load_results(out_path, run_id)} if out_path.exists() else set()
     answer = answer or _default_answer()
 
+    limited = 0
     with out_path.open("a", encoding="utf-8") as out:
         for q in questions:
-            text = f"{q.question}\nHint: {q.evidence}" if use_evidence and q.evidence else q.question
+            text = question_text(q, use_evidence)
             for mode in modes:
                 if (q.id, mode) in done:
                     report.already_done += 1
@@ -303,7 +326,13 @@ def run_eval(
                 except Exception as exc:  # noqa: BLE001 - one bad call must not end a long run
                     log.error("%s [%s] failed: %s", q.id, mode, exc)
                     report.errors.append((q.id, mode, str(exc)))
+                    limited = limited + 1 if isinstance(exc, RateLimited) else 0
+                    if limited >= MAX_RATE_LIMITED_IN_A_ROW:
+                        report.stopped = (f"the embedding service refused {limited} questions in a row (quota); stopping "
+                                          f"instead of failing the rest. Rerun the same command later to resume")
+                        return report
                     continue  # not written, so a resumed run tries it again
+                limited = 0
                 out.write(row.model_dump_json(by_alias=True) + "\n")
                 out.flush()
                 report.written += 1
@@ -410,10 +439,13 @@ def run_sweep(
     Finished rows are skipped on a rerun, so an interrupted sweep resumes. Gold queries are checked each time
     (cheap); a model call is made only for rows not yet written.
     """
-    return [
-        (v, run_eval(question_files, modes, out_path, f"{run_id}-{v.label}", top_k=v.top_k, expand=v.expand, **kwargs))
-        for v in variants
-    ]
+    reports: list[tuple[Variant, RunReport]] = []
+    for v in variants:
+        report = run_eval(question_files, modes, out_path, f"{run_id}-{v.label}", top_k=v.top_k, expand=v.expand, **kwargs)
+        reports.append((v, report))
+        if report.stopped:
+            break  # the quota is gone for every later variant too
+    return reports
 
 
 def aggregate_runs(results: list[EvalResult]) -> list[dict[str, Any]]:
@@ -505,6 +537,21 @@ def main(argv: list[str] | None = None) -> int:
         "skip_bad_gold": args.skip_bad_gold,
     }
     try:
+        if set(args.modes) - {"full"}:   # only these embed the question
+            try:
+                fetched = warm_query_cache(load_question_files(args.questions, args.split), not args.no_evidence)
+            except RateLimited as exc:
+                print(f"STOPPED: the embedding service is rate limited, nothing was run ({str(exc)[:300]}). "
+                      f"Rerun the same command later.", file=sys.stderr)
+                return EXIT_QUOTA
+            except ValueError:
+                raise
+            except Exception as exc:  # noqa: BLE001 - not fatal: the run reports its own errors
+                print(f"note: could not embed the questions in advance ({type(exc).__name__}: {str(exc)[:200]}); "
+                      f"embedding them one at a time", file=sys.stderr)
+            else:
+                if fetched:
+                    print(f"embedded {fetched} new questions in advance (cached in embedding.query_cache)")
         if args.sweep:
             variants = [parse_variant(spec) for spec in args.sweep]
             n = len(load_question_files(args.questions, args.split))
@@ -518,6 +565,10 @@ def main(argv: list[str] | None = None) -> int:
             prefix = f"{args.run_id}-"
             rows = [r for r in aggregate_runs(load_results(args.out)) if r["run_id"].startswith(prefix)]
             print(format_runs(rows))
+            stopped = next((rep.stopped for _, rep in reports if rep.stopped), None)
+            if stopped:
+                print(f"STOPPED: {stopped}", file=sys.stderr)
+                return EXIT_QUOTA
             return 1 if errors else 0
         expand = None
         if args.expand is not None:
@@ -533,6 +584,9 @@ def main(argv: list[str] | None = None) -> int:
     print(f"run {report.run_id}: wrote {report.written}, already done {report.already_done}, "
           f"bad gold {len(report.skipped_bad_gold)}, errors {len(report.errors)}")
     print(format_summary(aggregate(load_results(args.out, args.run_id))))
+    if report.stopped:
+        print(f"STOPPED: {report.stopped}", file=sys.stderr)
+        return EXIT_QUOTA
     return 1 if report.errors else 0
 
 

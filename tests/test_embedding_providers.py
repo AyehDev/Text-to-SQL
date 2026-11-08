@@ -494,3 +494,92 @@ def test_rate_limit_settings_and_gemini_batch_default():
         make_cfg(requests_per_minute=0)
     with pytest.raises(ValidationError):
         make_cfg(max_wait_s=-1)
+
+
+# ----------------------------------------------------------------- query cache
+
+
+def test_query_cache_is_off_unless_configured():
+    assert make_cfg().query_cache is None
+    assert vector.make_embedder(make_cfg(api_key_env=None))._query_cache is None
+
+
+def test_a_cached_question_is_not_sent_again(server, tmp_path):
+    cache = str(tmp_path / "cache" / "q.sqlite")
+    emb = vector.make_embedder(make_cfg(base_url=server, dimensions=3, api_key_env=None, query_cache=cache))
+    first = emb.embed_query("how many orders")
+    assert emb.embed_query("how many orders") == first and len(Handler.seen) == 1
+
+    again = vector.make_embedder(make_cfg(base_url=server, dimensions=3, api_key_env=None, query_cache=cache))
+    assert again.embed_query("how many orders") == first and len(Handler.seen) == 1      # a new process shares it
+    again.embed_query("a different question")
+    assert len(Handler.seen) == 2
+
+
+def test_the_cache_never_returns_another_models_vector(server, tmp_path):
+    cache = str(tmp_path / "q.sqlite")
+    for model in ("model-a", "model-b"):
+        vector.make_embedder(
+            make_cfg(base_url=server, dimensions=3, api_key_env=None, query_cache=cache, model=model)
+        ).embed_query("same question")
+    assert len(Handler.seen) == 2
+
+
+def test_documents_are_never_cached(server, tmp_path):
+    emb = vector.make_embedder(make_cfg(base_url=server, dimensions=3, api_key_env=None, query_cache=str(tmp_path / "q.sqlite")))
+    emb.embed_documents(["a"])
+    emb.embed_documents(["a"])
+    assert len(Handler.seen) == 2
+
+
+def test_an_unusable_cache_file_is_skipped_not_fatal(server, tmp_path):
+    blocker = tmp_path / "file"
+    blocker.write_text("not a directory")
+    emb = vector.make_embedder(
+        make_cfg(base_url=server, dimensions=3, api_key_env=None, query_cache=str(blocker / "q.sqlite")))
+    assert len(emb.embed_query("q")) == 3 and len(emb.embed_query("q")) == 3
+    assert len(Handler.seen) == 2
+
+
+def test_a_cached_vector_of_the_wrong_size_is_replaced(server, tmp_path):
+    cache = vector.QueryCache(tmp_path / "q.sqlite")
+    config = make_cfg(base_url=server, dimensions=3, api_key_env=None, query_cache=str(cache.path))
+    cache.put(cache.key(config, "q"), [1.0, 2.0])          # left by a config with other dimensions
+    assert len(vector.make_embedder(config).embed_query("q")) == 3 and len(Handler.seen) == 1
+
+
+def test_prefetch_embeds_every_new_question_in_batches_and_caches_them(server, tmp_path):
+    cache = str(tmp_path / "q.sqlite")
+    config = make_cfg(base_url=server, dimensions=3, api_key_env=None, query_cache=cache, batch_size=2)
+    emb = vector.make_embedder(config)
+    questions = ["a", "b", "c", "d", "e", "a"]                     # a repeated question is fetched once
+    assert emb.prefetch_queries(questions) == 5
+    assert [len(body["input"]) for _, _, body in Handler.seen] == [2, 2, 1]
+
+    assert [len(emb.embed_query(q)) for q in questions] == [3] * 6
+    assert emb.prefetch_queries(questions) == 0 and emb.prefetch_queries(questions + ["f"]) == 1
+    assert len(Handler.seen) == 4                                   # only "f" went out
+
+
+def test_prefetch_keeps_finished_batches_when_a_later_one_fails(server, tmp_path):
+    config = make_cfg(base_url=server, dimensions=3, api_key_env=None, query_cache=str(tmp_path / "q.sqlite"), batch_size=2)
+    emb = vector.make_embedder(config)
+    real = emb._embed_batch
+    calls = []
+
+    def flaky(texts, kind):
+        calls.append(texts)
+        if len(calls) == 2:
+            raise vector.RateLimited("quota")
+        return real(texts, kind)
+
+    emb._embed_batch = flaky
+    with pytest.raises(vector.RateLimited):
+        emb.prefetch_queries(["a", "b", "c", "d"])
+    emb._embed_batch = real
+    assert emb.prefetch_queries(["a", "b", "c", "d"]) == 2          # the first batch was kept
+
+
+def test_prefetch_does_nothing_without_a_cache(server):
+    emb = vector.make_embedder(make_cfg(base_url=server, dimensions=3, api_key_env=None))
+    assert emb.prefetch_queries(["a", "b"]) == 0 and Handler.seen == []

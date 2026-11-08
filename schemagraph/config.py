@@ -156,6 +156,11 @@ class EmbeddingConfig(BaseModel):
     timeout_s: float = Field(default=30.0, gt=0)
     max_wait_s: float = Field(default=120.0, ge=0)             # longest total wait on one rate-limited request
     requests_per_minute: int | None = Field(default=None, ge=1)  # pace calls to stay under a free-tier limit
+    # Remember each question's embedding in this SQLite file, so a question is paid for once however many modes,
+    # settings and reruns ask it (an evaluation sweep embeds the same question dozens of times). Keyed by
+    # provider, model, dimensions and text, so changing the model never returns another model's vector.
+    # null (the default) turns it off; delete the file to start over.
+    query_cache: str | None = None
 
     @field_validator("name")
     @classmethod

@@ -425,3 +425,117 @@ def test_each_question_is_asked_with_its_own_id_excluded_from_the_few_shot_examp
 
     run(tmp_path, answer, rows=[question(id="aw-dev-01", split="dev"), question(id="aw-dev-02", split="dev")], split="dev")
     assert excluded == [frozenset({"aw-dev-01"}), frozenset({"aw-dev-02"})]
+
+
+# ----------------------------------------------------------------- embedding quota
+
+
+def quota_error():
+    from schemagraph.graph.vector import RateLimited
+
+    return RateLimited("rate limited (HTTP 429)", retry_after=3600.0)
+
+
+def test_run_stops_after_three_quota_refusals_in_a_row_and_keeps_finished_rows(tmp_path):
+    rows = [question(id=f"q{i}") for i in range(8)]
+    calls = []
+
+    def answer(request, **k):
+        calls.append(request.question)
+        if len(calls) > 2:
+            raise quota_error()
+        return graph_response()
+
+    report, out = run(tmp_path, answer, rows=rows)
+    assert report.written == 2 and len(report.errors) == 3 and "quota" in report.stopped
+    assert len(calls) == 5                                      # not 8: the rest were not attempted
+    assert [r["question_id"] for r in read(out)] == ["q0", "q1"]
+
+    report2, out = run(tmp_path, lambda req, **k: graph_response(), rows=rows)   # quota back: resumes
+    assert report2.stopped is None and report2.already_done == 2 and report2.written == 6
+
+
+def test_isolated_quota_errors_and_other_errors_do_not_stop_a_run(tmp_path):
+    rows = [question(id=f"q{i}") for i in range(6)]
+    calls = []
+
+    def answer(request, **k):
+        calls.append(1)
+        n = len(calls)
+        if n in (1, 2, 4):
+            raise quota_error()
+        if n == 3:
+            raise RuntimeError("model error")                    # resets the streak
+        return graph_response()
+
+    report, _ = run(tmp_path, answer, rows=rows)
+    assert report.stopped is None and len(calls) == 6 and len(report.errors) == 4
+
+
+def test_sweep_stops_at_the_first_variant_that_hits_the_quota(tmp_path):
+    def answer(request, **k):
+        raise quota_error()
+
+    qfile = write_questions(tmp_path / "q.jsonl", [question(id=f"q{i}") for i in range(5)])
+    variants = [ev.parse_variant(s) for s in ("3", "5")]
+    reports = ev.run_sweep(variants, [qfile], ["graph"], tmp_path / "s.jsonl", "sw", llm_model="m", answer=answer,
+                           run_query=lambda d, s, n: GOLD, now=lambda: NOW)
+    assert len(reports) == 1 and reports[0][1].stopped
+
+
+# ----------------------------------------------------------------- embedding the questions in advance
+
+
+class FakeEmbedder:
+    def __init__(self):
+        self.texts = None
+
+    def prefetch_queries(self, texts):
+        self.texts = texts
+        return len(texts)
+
+
+def test_warm_query_cache_embeds_the_text_the_pipeline_will_be_asked(tmp_path):
+    qs = ev.load_questions(write_questions(tmp_path / "q.jsonl", [
+        question(id="a", question="plain"), question(id="b", question="hinted", evidence="a hint")]), "test")
+    emb = FakeEmbedder()
+    assert ev.warm_query_cache(qs, True, embedder=emb) == 2
+    assert emb.texts == ["plain", "hinted\nHint: a hint"]
+    ev.warm_query_cache(qs, False, embedder=emb)
+    assert emb.texts == ["plain", "hinted"]
+    assert ev.warm_query_cache(qs, True, embedder=object()) == 0       # an embedder without a cache has nothing to do
+
+
+def cli(tmp_path, monkeypatch, modes, warm):
+    from schemagraph.eval import run_eval as module
+
+    qfile = write_questions(tmp_path / "q.jsonl", [question()])
+    ran = []
+    monkeypatch.setattr(module, "warm_query_cache", warm)
+    monkeypatch.setattr(module, "run_eval", lambda *a, **k: ran.append(1) or module.RunReport("r"))
+    (tmp_path / "out.jsonl").write_text("")
+    code = module.main(["--questions", str(qfile), "--modes", *modes, "--out", str(tmp_path / "out.jsonl")])
+    return code, ran
+
+
+def test_cli_stops_before_running_when_the_questions_cannot_be_embedded(tmp_path, monkeypatch, capsys):
+    from schemagraph.graph.vector import RateLimited
+
+    def refuse(*a, **k):
+        raise RateLimited("daily quota")
+
+    code, ran = cli(tmp_path, monkeypatch, ["graph"], refuse)
+    assert code == 3 and ran == [] and "STOPPED" in capsys.readouterr().err
+
+
+def test_cli_does_not_embed_for_full_mode_and_survives_other_embedding_errors(tmp_path, monkeypatch, capsys):
+    def boom(*a, **k):
+        raise AssertionError("must not be called")
+
+    assert cli(tmp_path, monkeypatch, ["full"], boom) == (0, [1])
+
+    def broken(*a, **k):
+        raise RuntimeError("no embedding section")
+
+    code, ran = cli(tmp_path, monkeypatch, ["retrieval"], broken)
+    assert (code, ran) == (0, [1]) and "one at a time" in capsys.readouterr().err
