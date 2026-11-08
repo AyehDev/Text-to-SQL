@@ -4,6 +4,7 @@
     python scripts/smoke_test.py --db adventureworks --question "How many employees are there?"
     python scripts/smoke_test.py --db card_games --questions-file schemagraph/eval/questions/bird_subset.jsonl --n 5
     python scripts/smoke_test.py --db adventureworks --no-llm          # retrieval and join planning only
+    python scripts/smoke_test.py --db adventureworks --full-sql        # whole SQL, not a clipped line
 
 For each question and mode (full, retrieval, graph) it prints the tables retrieval found with their
 scores, the join plan, the tables the model was given, and, when an LLM is configured, the SQL, whether
@@ -229,7 +230,7 @@ def _clip(text: str, width: int = 110) -> str:
     return text if len(text) <= width else text[: width - 1] + "…"
 
 
-def format_rows(rows: list[Row], use_llm: bool) -> str:
+def format_rows(rows: list[Row], use_llm: bool, full_sql: bool = False) -> str:
     lines: list[str] = []
     last = None
     for r in rows:
@@ -260,7 +261,11 @@ def format_rows(rows: list[Row], use_llm: bool) -> str:
         if r.mode != "full" and r.tables:
             lines.append("      given to the model: " + ", ".join(r.tables))
         if r.sql:
-            lines.append(f"      sql: {_clip(r.sql)}")
+            if full_sql:
+                lines.append("      sql:")
+                lines += [f"        {line}" for line in r.sql.strip().splitlines()]
+            else:
+                lines.append(f"      sql: {_clip(r.sql)}")
     lines += ["", summary(rows, use_llm)]
     return "\n".join(lines)
 
@@ -301,6 +306,7 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--mode", action="append", choices=MODES, help="mode to run (repeatable; default all three)")
     parser.add_argument("--top-k", type=int, default=5)
     parser.add_argument("--no-llm", action="store_true", help="retrieval and join planning only")
+    parser.add_argument("--full-sql", action="store_true", help="print the whole generated SQL, not one clipped line")
     args = parser.parse_args(argv)
 
     from schemagraph.config import get_config
@@ -332,7 +338,7 @@ def main(argv: list[str] | None = None) -> int:
     finally:
         driver.close_driver()
 
-    print(format_rows(rows, use_llm))
+    print(format_rows(rows, use_llm, full_sql=args.full_sql))
     return 0 if all(r.ok for r in rows) else 1
 
 

@@ -183,6 +183,26 @@ def test_format_shows_each_mode_and_a_summary():
     assert "graph     1 runs, 0 errors, mean gold-table recall 100%, SQL ran 1/1, matches gold 1/1" in text
 
 
+def test_full_sql_prints_every_line_unclipped():
+    sql = "SELECT a,\n       b\nFROM " + "very_long_table_name_" * 12
+    rows = [smoke.Row("q", "graph", status="success", sql=sql)]
+    clipped = smoke.format_rows(rows, use_llm=True)
+    assert "…" in clipped and "very_long_table_name_" * 12 not in clipped
+    full = smoke.format_rows(rows, use_llm=True, full_sql=True)
+    assert "        SELECT a," in full and "               b" in full and "very_long_table_name_" * 12 in full
+
+
+def test_cli_full_sql_flag(cli, capsys, monkeypatch):
+    from schemagraph.pipeline import pipeline
+
+    long_sql = "SELECT 1 FROM " + "t" * 200
+    monkeypatch.setattr(pipeline, "answer_question", lambda request, explain=True: response(request.mode, sql=long_sql))
+    assert smoke.main(["--db", DB, "--question", "q", "--mode", "graph"]) == 0
+    assert "t" * 200 not in capsys.readouterr().out
+    assert smoke.main(["--db", DB, "--question", "q", "--mode", "graph", "--full-sql"]) == 0
+    assert "t" * 200 in capsys.readouterr().out
+
+
 def test_format_marks_errors_and_long_text_is_clipped():
     rows = [smoke.Row("q", "graph", error="context: RuntimeError: x"), smoke.Row("w " * 300, "full", status="success")]
     text = smoke.format_rows(rows, use_llm=True)
@@ -196,7 +216,9 @@ def test_format_marks_errors_and_long_text_is_clipped():
 @pytest.fixture
 def cli(monkeypatch):
     from schemagraph import db
-    from schemagraph.config import get_config  # noqa: F401 - imported so the attribute exists to patch
+    from schemagraph.config import (
+        get_config,  # noqa: F401 - imported so the attribute exists to patch
+    )
     from schemagraph.graph import driver
     from schemagraph.pipeline import context, pipeline
 
