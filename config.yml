@@ -53,3 +53,38 @@ embedding:
 # To keep two models in one graph (for example to compare them), give each its own `name`
 # and switch between configs with SCHEMAGRAPH_CONFIG. Vectors and indexes are stored per name.
 #   name: voyage
+
+# Chat model that writes the SQL and the one-line explanation (pipeline/llm.py). Any OpenAI-compatible
+# /chat/completions endpoint works; the key itself only ever lives in the environment.
+#
+# Google Gemini through its OpenAI-compatible endpoint (same GEMINI_API_KEY as the embeddings):
+llm:
+  provider: openai_compatible
+  base_url: https://generativelanguage.googleapis.com/v1beta/openai
+  model: gemini-3.5-flash          # any chat model your key can use
+  api_key_env: GEMINI_API_KEY
+  timeout_s: 60
+  temperature: 0
+  max_tokens: 4096                 # Gemini 2.5 models count their hidden "thinking" tokens against this
+#
+# OpenAI:
+# llm:
+#   provider: openai_compatible
+#   base_url: https://api.openai.com/v1
+#   model: gpt-4o-mini             # newer reasoning models reject max_tokens/temperature (HTTP 400)
+#   api_key_env: OPENAI_API_KEY
+#
+# A local server (Ollama, vLLM, LM Studio), no key:
+# llm:
+#   provider: openai_compatible
+#   base_url: http://localhost:11434/v1
+#   model: qwen2.5-coder:14b
+#   api_key_env: null
+
+# Defaults for answer_question; a request's `options` override them.
+pipeline:
+  top_k: 5                         # tables retrieval returns
+  max_attempts: 3                  # SQL generation tries, feeding each error back to the model
+  row_limit: 100                   # rows returned to the caller
+  examples_k: 3                    # few-shot examples (dev split only); none if the file is missing
+  fewshot_path: schemagraph/eval/questions/fewshot_examples.jsonl
