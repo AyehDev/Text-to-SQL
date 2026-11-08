@@ -243,6 +243,24 @@ and, with an `llm:` section in `config.yml`, the SQL, whether it ran, and its co
 whether the result matches the gold result and what share of the gold tables the model was given. It stores nothing.
 Exit code 1 means some question hit an error (shown on its line), 2 means it could not start.
 
+### Score retrieval on its own
+
+The smoke test shows a few questions in detail; this scores all of them, with no LLM and no Postgres:
+
+```bash
+python scripts/retrieval_eval.py --db adventureworks --questions-file schemagraph/eval/questions/adventureworks.jsonl \
+    --label gemini-1536 --out runs/gemini.json
+python scripts/retrieval_eval.py --compare runs/openai.json runs/gemini.json     # side by side
+```
+
+It embeds each question once and reports (1) recall@k: how many of the tables the gold SQL reads are among the k
+best-scoring tables, (2) the mean score at ranks 1, 5 and 20, which shows whether scores separate relevant tables from
+noise, and (3) for each seed-pruning strategy (`top_k` and a score `gap` below the best), the planner's context as the
+model would see it: recall and the average number of tables. Use it to choose `top_k` and to compare embedding
+models: build one graph (or one named vector set, `embedding.name`) per model, run once per model with
+`SCHEMAGRAPH_CONFIG=<config>` and `--out`, then `--compare`. Runs are comparable only on the same question file and split.
+`--no-graph` skips the planning part.
+
 ## API reference
 
 The backend is a FastAPI app (`schemagraph/api/main.py`, Mohammed). It serves OpenAPI docs at `/docs` and the
