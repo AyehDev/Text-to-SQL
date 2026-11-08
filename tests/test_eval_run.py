@@ -237,7 +237,7 @@ def test_request_shape_and_flags(tmp_path):
     assert (r1.mode, r2.mode) == ("full", "graph")
     assert r1.options.row_limit == ev.GOLD_ROW_LIMIT
     assert r1.question == "total per person\nHint: firstname is the given name"
-    assert k1 == {"explain": False, "planner_options": {"weighted": False}}
+    assert k1 == {"explain": False, "planner_options": {"weighted": False}, "exclude_example_ids": frozenset({"aw-001"})}
 
 
 def test_evidence_can_be_left_out_and_planner_options_omitted_when_empty(tmp_path):
@@ -248,7 +248,7 @@ def test_evidence_can_be_left_out_and_planner_options_omitted_when_empty(tmp_pat
         return graph_response()
 
     run(tmp_path, answer, rows=[question(evidence="hint")], use_evidence=False)
-    assert seen[0][0].question == "total per person" and seen[0][1] == {"explain": False}
+    assert seen[0][0].question == "total per person" and seen[0][1] == {"explain": False, "exclude_example_ids": frozenset({"aw-001"})}
 
 
 def test_unknown_mode_is_rejected(tmp_path):
@@ -372,9 +372,9 @@ def test_run_eval_passes_top_k_and_expansion_to_the_pipeline_only_when_given(tmp
         return graph_response()
 
     run(tmp_path, answer)
-    assert seen[-1] == (None, {})
+    assert seen[-1] == (None, {"exclude_example_ids": frozenset({"aw-001"})})
     run(tmp_path, answer, top_k=8, expand={"max_added": 4, "hops": 2}, rows=[question(id="aw-002")])
-    assert seen[-1] == (8, {"expand": {"max_added": 4, "hops": 2}})
+    assert seen[-1] == (8, {"exclude_example_ids": frozenset({"aw-002"}), "expand": {"max_added": 4, "hops": 2}})
 
 
 def test_sweep_runs_every_variant_under_its_own_run_id_and_resumes(tmp_path):
@@ -413,3 +413,15 @@ def test_cli_compare_runs_prints_one_row_per_run(tmp_path, capsys):
     assert ev.main(["--compare-runs", str(out)]) == 0
     printed = capsys.readouterr().out
     assert "run-a" in printed and "graph" in printed
+
+
+def test_each_question_is_asked_with_its_own_id_excluded_from_the_few_shot_examples(tmp_path):
+    """A dev question is also a few-shot example; without this the model would be shown its own answer."""
+    excluded = []
+
+    def answer(request, explain=False, **kw):
+        excluded.append(kw["exclude_example_ids"])
+        return graph_response()
+
+    run(tmp_path, answer, rows=[question(id="aw-dev-01", split="dev"), question(id="aw-dev-02", split="dev")], split="dev")
+    assert excluded == [frozenset({"aw-dev-01"}), frozenset({"aw-dev-02"})]

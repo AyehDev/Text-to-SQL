@@ -292,7 +292,10 @@ def run_eval(
                     options=AskOptions(row_limit=GOLD_ROW_LIMIT, top_k=top_k),
                 )
                 try:
-                    kwargs = {"planner_options": planner_options} if planner_options else {}
+                    # A dev question is also a few-shot example: never show the model the one it is being asked.
+                    kwargs: dict[str, Any] = {"exclude_example_ids": frozenset({q.id})}
+                    if planner_options:
+                        kwargs["planner_options"] = planner_options
                     if expand is not None:
                         kwargs["expand"] = expand
                     response = answer(request, explain=False, **kwargs)

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import time
 import uuid
+from collections.abc import Collection
 
 import psycopg
 
@@ -36,6 +37,7 @@ def answer_question(
     *,
     planner_options: dict | None = None,
     expand: dict | None = None,
+    exclude_example_ids: Collection[str] | None = None,
 ) -> AskResponse:
     """Answer one question; the evaluation harness uses this same entry point.
 
@@ -44,6 +46,8 @@ def answer_question(
 
     `expand` ({"max_added": N, "hops": H}) overrides the config's `pipeline.expand_seeds` for this
     call (the evaluation sweeps use it); N = 0 turns expansion off. None uses the config.
+    `exclude_example_ids` keeps those few-shot examples out of the prompt; the evaluation passes the id of the
+    question it is asking, so a dev question is never shown to the model with its own answer.
     """
     started_total = time.perf_counter()
     config = get_config()
@@ -72,7 +76,9 @@ def answer_question(
         **({"expand": use_expand} if (use_expand := expand if expand is not None else expand_options(pipeline_config)) else {}),
     )
     examples_started = time.perf_counter()
-    examples = retrieve_examples(request.db_id, request.question, pipeline_config.examples_k)
+    examples = retrieve_examples(
+        request.db_id, request.question, pipeline_config.examples_k, exclude_example_ids or ()
+    )
     latency["retrieval"] += _elapsed_ms(examples_started)
     attempts: list[Attempt] = []
     input_tokens = 0

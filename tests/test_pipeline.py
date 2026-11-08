@@ -222,3 +222,12 @@ def test_no_expansion_argument_is_passed_when_it_is_off_everywhere(monkeypatch, 
     seen = _stub_pipeline(monkeypatch, ask_request, fake_config)
     pipeline.answer_question(ask_request, explain=False)
     assert "expand" not in seen[-1]
+
+
+def test_the_example_exclusion_reaches_the_few_shot_lookup(monkeypatch, ask_request, fake_config):
+    _stub_pipeline(monkeypatch, ask_request, fake_config)
+    got = []
+    monkeypatch.setattr(pipeline, "retrieve_examples", lambda *args: got.append(args) or [])
+    pipeline.answer_question(ask_request, explain=False, exclude_example_ids={"aw-dev-03"})
+    pipeline.answer_question(ask_request, explain=False)
+    assert got[0][3] == {"aw-dev-03"} and got[1][3] == ()

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import logging
 import re
+from collections.abc import Collection
 from functools import lru_cache
 from pathlib import Path
 
@@ -35,14 +36,21 @@ def _load_examples(path: str, _modified_ns: int | None) -> tuple[FewShotExample,
     return tuple(examples)
 
 
-def retrieve_examples(db_id: str, question: str, k: int = 3) -> list[FewShotExample]:
-    """Return the top lexical-overlap development examples for this database."""
+def retrieve_examples(
+    db_id: str, question: str, k: int = 3, exclude_ids: Collection[str] = ()
+) -> list[FewShotExample]:
+    """Return the top lexical-overlap development examples for this database.
+
+    `exclude_ids` are example ids that must not be returned. The evaluation passes the id of the question it is
+    asking: a dev question is also a few-shot example, and without this it would be its own best match, so the
+    model would be shown the question with its gold SQL.
+    """
     if k <= 0 or not question.strip():
         return []
     path = str(get_config().pipeline.fewshot_path)
     file_path = Path(path)
     modified_ns = file_path.stat().st_mtime_ns if file_path.exists() else None
-    candidates = [example for example in _load_examples(path, modified_ns) if example.db_id == db_id]
+    candidates = [example for example in _load_examples(path, modified_ns) if example.db_id == db_id and example.id not in exclude_ids]
     query_words = set(_WORD.findall(question.lower()))
 
     def rank(example: FewShotExample) -> tuple[float, str]:

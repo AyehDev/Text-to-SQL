@@ -483,7 +483,8 @@ python -m schemagraph.eval.run_eval --compare-runs results/sweep.jsonl      # th
 
 Each variant is its own run id (`sweep-k8+4h2`), so an interrupted sweep resumes and finished rows are never asked
 twice. It prints how many model calls it may make first (questions x modes x variants). `--top-k` and `--expand N[:H]`
-override the config for a single ordinary run. Use the test split for the final choice and the dev split while exploring.
+override the config for a single ordinary run. Use the test split for the final choice and the dev split while exploring. Dev questions are also the few-shot examples, so `run_eval` tells the pipeline to leave a question's own
+example out of its prompt (`exclude_example_ids`); without that, a dev run would show the model the answer.
 
 ### Building the question files
 
