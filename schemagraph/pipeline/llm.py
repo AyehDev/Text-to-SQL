@@ -14,6 +14,24 @@ class LLMError(RuntimeError):
     """The configured chat service failed or returned an unusable response."""
 
 
+def error_detail(raw: bytes, limit: int = 300) -> str:
+    """The service's own explanation of an HTTP error, from an OpenAI-style `{"error": {"message"}}` body,
+    Google's list-wrapped form, or plain text. Empty if the body says nothing. Never contains the request."""
+    text = raw.decode("utf-8", errors="replace").strip()
+    try:
+        body = json.loads(text)
+        if isinstance(body, list) and body:
+            body = body[0]
+        error = body.get("error") if isinstance(body, dict) else None
+        message = error.get("message") if isinstance(error, dict) else error
+        if isinstance(message, str) and message.strip():
+            text = message.strip()
+    except (json.JSONDecodeError, AttributeError):
+        pass
+    text = " ".join(text.split())
+    return text if len(text) <= limit else text[: limit - 1] + "…"
+
+
 def chat_completion(messages: list[dict[str, str]]) -> tuple[str, int, int]:
     """Return assistant text and prompt/completion token counts."""
     config = get_config().llm
@@ -45,7 +63,12 @@ def complete(config: LLMConfig, messages: list[dict[str, str]]) -> tuple[str, in
         with urllib.request.urlopen(request, timeout=config.timeout_s) as response:
             body = json.loads(response.read().decode("utf-8"))
     except urllib.error.HTTPError as exc:
-        raise LLMError(f"chat service returned HTTP {exc.code}") from exc
+        detail = error_detail(exc.read()[:4000]) if exc.fp is not None else ""
+        raise LLMError(
+            f"chat service returned HTTP {exc.code}"
+            + (f": {detail}" if detail else "")
+            + f" (POST {request.full_url}, model {config.model!r})"
+        ) from exc
     except (urllib.error.URLError, TimeoutError) as exc:
         raise LLMError(f"could not reach chat service: {exc}") from exc
     except (json.JSONDecodeError, UnicodeDecodeError) as exc:

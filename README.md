@@ -227,6 +227,22 @@ Vectors written before fingerprints existed are replaced once. In `config.yml` u
 otherwise, which matters on tiers limited by requests per minute. Retrieval skips nodes without a vector, so do not rely on a
 partial graph for answers; the coverage numbers in the summary say how far it got.
 
+### Smoke test the whole path
+
+After building a graph, push a few questions through the real services before any long run:
+
+```bash
+python scripts/smoke_test.py --db adventureworks                       # five built-in questions, all three modes
+python scripts/smoke_test.py --db adventureworks --question "How many employees are there?" --mode graph
+python scripts/smoke_test.py --db card_games --questions-file schemagraph/eval/questions/bird_subset.jsonl --n 5
+python scripts/smoke_test.py --db adventureworks --no-llm              # retrieval and join planning only
+```
+
+For each question and mode it prints what retrieval found (with scores), the join plan, the tables the model was given,
+and, with an `llm:` section in `config.yml`, the SQL, whether it ran, and its cost. With a questions file it also says
+whether the result matches the gold result and what share of the gold tables the model was given. It stores nothing.
+Exit code 1 means some question hit an error (shown on its line), 2 means it could not start.
+
 ## API reference
 
 The backend is a FastAPI app (`schemagraph/api/main.py`, Mohammed). It serves OpenAPI docs at `/docs` and the
